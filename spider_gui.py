@@ -302,8 +302,8 @@ def run_pipeline(url: str, text_sel: str, comment_sel: str,
 # GUI
 # ─────────────────────────────────────────────────────────────────────────────
 
-BG      = "#1a1a2e"
-PANEL   = "#16213e"
+BG      = "#F6F5F5"
+PANEL   = "#060606"
 CARD    = "#0f3460"
 ACCENT  = "#e94560"
 ACCENT2 = "#53d8fb"
