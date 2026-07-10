@@ -284,8 +284,8 @@ INPUT_BD  = "#D8DCE3"
 ACCENT    = "#4F6BF6"   # primary blue
 ACCENT_HV = "#3D56D9"
 ACCENT_SOFT = "#EEF1FE"
-FG        = "#1F2430"   # main text
-DIM       = "#8A8F98"   # secondary text
+FG        = "#000000"   # main text (pure black for max readability)
+DIM       = "#2B2F36"   # secondary text (dark, near-black instead of light gray)
 SUCCESS   = "#1E9E5A"
 ERR       = "#E5484D"
 MONO      = ("Consolas", 9)
@@ -352,7 +352,7 @@ class ScraperApp(tk.Tk):
 
         # Tabs
         s.configure("TNotebook", background=BG, borderwidth=0)
-        s.configure("TNotebook.Tab", background=CARD, foreground=DIM,
+        s.configure("TNotebook.Tab", background=CARD, foreground=FG,
                     padding=(16, 8), font=UI, borderwidth=0)
         s.map("TNotebook.Tab",
               background=[("selected", BG)],
@@ -361,7 +361,7 @@ class ScraperApp(tk.Tk):
 
         # Group box (Options card)
         s.configure("TLabelframe", background=BG, bordercolor=CARD_BD, borderwidth=1)
-        s.configure("TLabelframe.Label", background=BG, foreground=DIM, font=LABEL_F)
+        s.configure("TLabelframe.Label", background=BG, foreground=FG, font=LABEL_F)
 
         s.configure("TCheckbutton", background=BG, foreground=FG, font=UI)
         s.map("TCheckbutton", background=[("active", BG)])
@@ -372,7 +372,7 @@ class ScraperApp(tk.Tk):
 
         s.configure("TSpinbox", fieldbackground=INPUT_BG, foreground=FG,
                     background=INPUT_BG, bordercolor=INPUT_BD,
-                    arrowcolor=DIM, insertcolor=FG, padding=4)
+                    arrowcolor=FG, insertcolor=FG, padding=4)
         s.map("TSpinbox",
               fieldbackground=[("readonly", INPUT_BG)],
               background=[("active", CARD)])
@@ -392,7 +392,7 @@ class ScraperApp(tk.Tk):
         tk.Label(title_row, text="  Modern Web Scraper",
                  bg=BG, fg=FG, font=H1).pack(side="left")
         tk.Label(title_row, text="   Real Chromium browser · handles JS / SPAs / lazy-load",
-                 bg=BG, fg=DIM, font=("Segoe UI", 9)).pack(side="left", padx=(4, 0))
+                 bg=BG, fg=FG, font=("Segoe UI", 9)).pack(side="left", padx=(4, 0))
 
         ttk.Separator(self).pack(fill="x", padx=18, pady=(12, 12))
 
@@ -403,7 +403,7 @@ class ScraperApp(tk.Tk):
         inner = tk.Frame(url_card, bg=CARD)
         inner.pack(fill="x", padx=14, pady=12)
 
-        tk.Label(inner, text="Target URL", bg=CARD, fg=DIM,
+        tk.Label(inner, text="Target URL", bg=CARD, fg=FG,
                  font=LABEL_F).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
 
         self.url_var = tk.StringVar()
@@ -423,17 +423,17 @@ class ScraperApp(tk.Tk):
         opt = tk.Frame(opt_card, bg=CARD)
         opt.pack(fill="x", padx=14, pady=12)
 
-        tk.Label(opt, text="Advanced Options", bg=CARD, fg=DIM,
+        tk.Label(opt, text="Advanced Options", bg=CARD, fg=FG,
                  font=LABEL_F).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 8))
 
         # Row 1 — selectors
-        tk.Label(opt, text="Text selector (CSS)", bg=CARD, fg=DIM,
+        tk.Label(opt, text="Text selector (CSS)", bg=CARD, fg=FG,
                  font=LABEL_F).grid(row=1, column=0, sticky="w", padx=(0, 6), pady=4)
         self.text_sel_var = tk.StringVar()
         ttk.Entry(opt, textvariable=self.text_sel_var,
                   width=28).grid(row=1, column=1, sticky="we", padx=(0, 24), pady=4, ipady=2)
 
-        tk.Label(opt, text="Comment selector (CSS)", bg=CARD, fg=DIM,
+        tk.Label(opt, text="Comment selector (CSS)", bg=CARD, fg=FG,
                  font=LABEL_F).grid(row=1, column=2, sticky="w", padx=(0, 6), pady=4)
         self.cmt_sel_var = tk.StringVar()
         ttk.Entry(opt, textvariable=self.cmt_sel_var,
@@ -443,7 +443,7 @@ class ScraperApp(tk.Tk):
         opt.columnconfigure(3, weight=1)
 
         # Row 2 — cookie
-        tk.Label(opt, text="Cookie (optional, bypasses anti-bot checks)", bg=CARD, fg=DIM,
+        tk.Label(opt, text="Cookie (optional, bypasses anti-bot checks)", bg=CARD, fg=FG,
                  font=LABEL_F).grid(row=2, column=0, sticky="w", padx=(0, 6), pady=4)
         self.cookie_var = tk.StringVar()
         ttk.Entry(opt, textvariable=self.cookie_var,
@@ -454,7 +454,7 @@ class ScraperApp(tk.Tk):
         wait_row = tk.Frame(opt, bg=CARD)
         wait_row.grid(row=3, column=0, columnspan=4, sticky="we", pady=(10, 0))
 
-        tk.Label(wait_row, text="JS wait (ms)", bg=CARD, fg=DIM,
+        tk.Label(wait_row, text="JS wait (ms)", bg=CARD, fg=FG,
                  font=LABEL_F).pack(side="left", padx=(0, 8))
         self.wait_var = tk.IntVar(value=2500)
         ttk.Spinbox(wait_row, from_=500, to=12000, increment=500,
@@ -467,7 +467,7 @@ class ScraperApp(tk.Tk):
 
         tk.Label(opt,
                  text="Tip: leave selectors blank for auto-detection. Increase JS wait for slow React/Vue SPAs.",
-                 bg=CARD, fg=DIM, font=("Segoe UI", 8)).grid(
+                 bg=CARD, fg=FG, font=("Segoe UI", 8)).grid(
             row=4, column=0, columnspan=4, sticky="w", pady=(10, 0))
 
         # ── Progress ────────────────────────────────────────────
@@ -502,7 +502,7 @@ class ScraperApp(tk.Tk):
 
         self.status_var = tk.StringVar(value="Ready.")
         tk.Label(bar, textvariable=self.status_var,
-                 bg=BG, fg=DIM, font=("Segoe UI", 9)).pack(side="left", padx=10)
+                 bg=BG, fg=FG, font=("Segoe UI", 9)).pack(side="left", padx=10)
 
     def _tab(self, label: str) -> scrolledtext.ScrolledText:
         frame = tk.Frame(self.nb, bg=BG)
