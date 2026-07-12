@@ -8,6 +8,12 @@ A Playwright-powered web scraper with a FastAPI web UI. It launches a real Chrom
 
 ---
 
+## Demo
+
+![Usage demo](demo.gif)
+
+*Enter a URL → open Advanced Options → start scrape → view Text, Log, and Selectors tabs.*
+
 ![Screenshot](image.png)
 
 ## Features
@@ -49,12 +55,15 @@ spaider_crawler/
 ├── selector_engine.py  # Smart CSS selector discovery (heuristic + AI)
 ├── requirements.txt
 ├── payload.json        # Example API request body
+├── demo.gif            # Usage demo animation for README
 ├── .env.example        # AI API key template (copy to .env)
 ├── templates/
 │   └── index.html      # Web UI
-└── static/
-    ├── css/style.css
-    └── js/app.js
+├── static/
+│   ├── css/style.css
+│   └── js/app.js
+└── scripts/
+    └── record_demo_gif.py  # Regenerate demo.gif for README
 ```
 
 ---

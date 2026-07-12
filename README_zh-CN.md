@@ -8,7 +8,13 @@
 
 ---
 
-![Screenshot](image.png)
+## 使用演示
+
+![使用演示](demo.gif)
+
+*输入 URL → 打开高级选项 → 开始抓取 → 查看正文、日志与选择器选项卡。*
+
+![截图](image.png)
 
 ## 功能特性
 
@@ -49,12 +55,15 @@ spaider_crawler/
 ├── selector_engine.py  # 智能 CSS 选择器发现（启发式 + AI）
 ├── requirements.txt
 ├── payload.json        # API 请求示例
+├── demo.gif            # README 使用演示动图
 ├── .env.example        # AI API Key 模板（复制为 .env）
 ├── templates/
 │   └── index.html      # Web 界面
-└── static/
-    ├── css/style.css
-    └── js/app.js
+├── static/
+│   ├── css/style.css
+│   └── js/app.js
+└── scripts/
+    └── record_demo_gif.py  # 重新生成 README 演示 GIF
 ```
 
 ---
