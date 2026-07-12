@@ -1,11 +1,9 @@
 # 🕷 Modern Web Scraper
 
-This repository contains a Playwright-powered web scraper with two user interfaces:
 
-- A web UI served by FastAPI (access at `http://localhost:8000/`) — implemented in `app.py` + `templates/` + `static/`.
-- A desktop GUI built with Tkinter (`spider_gui.py`) for local, single-machine use.
+This repository contains a Playwright-powered web scraper with a web user interface served by FastAPI (access at `http://localhost:8000/`) implemented in `app.py` + `templates/` + `static/`.
 
-Both interfaces use the same core pipeline (`scraper_core.py`) which launches a real Chromium browser (via Playwright), renders the page, and extracts structured data (body text, comments, video links, images, and meta tags).
+The core pipeline (`scraper_core.py`) launches a real Chromium browser (via Playwright), renders the page, and extracts structured data (body text, comments, video links, images, and meta tags).
 
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)
@@ -95,15 +93,9 @@ Invoke-WebRequest -Uri http://127.0.0.1:8000/api/scrape -Method Post -Body (Get-
 
 ---
 
-## Run the Desktop GUI (Tkinter)
+## Desktop GUI Removed
 
-Run the GUI locally:
-
-```bash
-python spider_gui.py
-```
-
-The GUI provides the same options as the web UI and is suitable for interactive, single-machine use.
+The original Tkinter-based desktop GUI (`spider_gui.py`) has been removed from this repository. Use the FastAPI web UI (`app.py`) instead by following the "Run the Web UI (FastAPI)" instructions above.
 
 ---
 
