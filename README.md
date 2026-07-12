@@ -1,137 +1,155 @@
 # 🕷 Modern Web Scraper
 
-A desktop web scraping tool powered by **Playwright (real Chromium engine)**, wrapped in a clean, light-themed Tkinter GUI. Unlike traditional `requests` + `BeautifulSoup` scrapers, this tool renders pages through an actual browser — so it handles JavaScript-heavy SPAs, lazy-loaded content, and dynamic sites out of the box.
+This repository contains a Playwright-powered web scraper with two user interfaces:
+
+- A web UI served by FastAPI (access at `http://localhost:8000/`) — implemented in `app.py` + `templates/` + `static/`.
+- A desktop GUI built with Tkinter (`spider_gui.py`) for local, single-machine use.
+
+Both interfaces use the same core pipeline (`scraper_core.py`) which launches a real Chromium browser (via Playwright), renders the page, and extracts structured data (body text, comments, video links, images, and meta tags).
 
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
-![Screenshot](image.png)
+---
+
+## Features
+
+- Real Chromium rendering (Playwright) — executes JavaScript and supports SPAs
+- Body text auto-detection + optional CSS selector override
+- Heuristic comment extraction + optional CSS selector override
+- Video and image link extraction
+- Metadata extraction from `<meta>` tags
+- Cookie injection to carry session state
+- Lightweight anti-detection patches (built-in + optional `playwright-stealth`)
+- Auto-scroll to trigger lazy-loaded content
+- Export results to TXT or JSON
 
 ---
 
-## ✨ Features
+## Requirements
 
-| | |
-|---|---|
-| 🌐 **Real browser engine** | Built on Playwright + Chromium — fully executes JavaScript, works with SPAs (React/Vue/etc.) |
-| 📄 **Body text extraction** | Auto-detects the main content region across common site layouts, or use a custom CSS selector |
-| 💬 **Comment extraction** | Heuristic keyword-based detection of comment sections, overridable with a custom selector |
-| 🎬 **Video link extraction** | Detects `<video>`/`<source>` tags and common video-platform iframe embeds |
-| 🖼 **Image extraction** | Collects image resources on the page (up to 50) |
-| 🏷 **Metadata extraction** | Pulls all `<meta>` tags into structured output |
-| 🍪 **Cookie support** | Inject a cookie string to carry your own session/login state |
-| 🕵️ **Lightweight anti-detection** | Masks common automation fingerprints (`navigator.webdriver`, etc.), randomizes UA/viewport/timing — uses [`playwright-stealth`](https://pypi.org/project/playwright-stealth/) if installed, falls back to a built-in patch otherwise |
-| 📜 **Auto-scroll** | Optionally scrolls the page to trigger lazy-loaded content |
-| 💾 **Export** | Save results as `.txt` or structured `.json` |
-| 🎨 **Clean GUI** | Notion/Linear-inspired light interface with a live log panel |
-
----
-
-## 📦 Installation
-
-**Requirements**
 - Python 3.10+
-- A desktop environment (Tkinter needs a display) on Windows / macOS / Linux
+- `pip` and a writable Python environment
+- For the GUI: a display environment (Tkinter) — on headless servers prefer the web UI
 
-**Steps**
+Dependencies are listed in `requirements.txt`.
+
+---
+
+## Installation
+
+1. Create and activate a virtual environment (recommended):
 
 ```bash
-# 1. Clone the repository
-git clone https://github.com/<your-username>/<your-repo>.git
-cd <your-repo>
+python -m venv .venv
+# Windows
+.venv\Scripts\activate
+# macOS / Linux
+source .venv/bin/activate
+```
 
-# 2. Install dependencies
-pip install playwright beautifulsoup4 lxml playwright-stealth
+2. Install Python dependencies:
 
-# 3. Install the Chromium browser used by Playwright
+```bash
+pip install -r requirements.txt
+```
+
+3. Install Playwright browser binaries (required for Playwright to run):
+
+```bash
 python -m playwright install chromium
 ```
 
-> 💡 `playwright-stealth` is optional — the tool falls back to a built-in fingerprint patch if it isn't installed.
-> 💡 Tkinter usually ships with Python. On Linux, if it's missing: `sudo apt install python3-tk`.
+Notes:
+- `playwright-stealth` is optional — the code falls back to a small built-in patch when it's not available.
+- On Linux, you may need system packages for Chromium to run (fonts, libgtk, etc.).
 
 ---
 
-## 🚀 Usage
+## Run the Web UI (FastAPI)
+
+Start the server (development):
 
 ```bash
-python scraper.py
+python app.py
+# or with uvicorn directly
+python -m uvicorn app:app --host 127.0.0.1 --port 8000 --reload
 ```
 
-1. Enter the target URL in **Target URL**, then press Enter or click **▶ Scrape**.
-2. Optionally configure **Advanced Options**:
+Open `http://127.0.0.1:8000/` in your browser. The web UI mirrors the desktop GUI: enter a URL, configure optional selectors/cookie/wait time/scroll, and click `Start Scrape`.
 
-   | Option | Description |
-   |---|---|
-   | Text selector | CSS selector for the article body (blank = auto-detect) |
-   | Comment selector | CSS selector for comments (blank = heuristic keyword detection) |
-   | Cookie | `key1=value1; key2=value2` — carries your own session/login state |
-   | JS wait (ms) | How long to wait after page load for JS to finish rendering; raise for slow SPAs |
-   | Auto-scroll | Scrolls the page automatically to trigger lazy-loaded content |
+You can also call the API programmatically (`POST /api/scrape`) — it returns a Server-Sent Events (SSE) stream of logs and a final `done` event containing the JSON result.
 
-3. Review results across tabs: 📄 Body Text · 💬 Comments · 🎬 Videos · 🖼 Images · 🏷 Meta/JSON · 📡 Log
-4. Export with **💾 Save TXT** / **💾 Save JSON**.
+Example (PowerShell):
+
+```powershell
+Invoke-WebRequest -Uri http://127.0.0.1:8000/api/scrape -Method Post -Body '{"url":"https://example.com","text_selector":"","comment_selector":"","cookie":"","wait_ms":2500,"scroll":true}' -ContentType "application/json"
+```
+
+Or save the response stream to a file:
+
+```powershell
+Invoke-WebRequest -Uri http://127.0.0.1:8000/api/scrape -Method Post -Body (Get-Content payload.json -Raw) -ContentType "application/json" -OutFile sse_response.txt
+```
 
 ---
 
-## 🗂 Example Output (JSON)
+## Run the Desktop GUI (Tkinter)
+
+Run the GUI locally:
+
+```bash
+python spider_gui.py
+```
+
+The GUI provides the same options as the web UI and is suitable for interactive, single-machine use.
+
+---
+
+## API Output
+
+After a successful scrape the pipeline returns a JSON object similar to:
 
 ```json
 {
-  "url": "https://example.com/article/123",
-  "title": "Article Title",
-  "text_paragraphs": ["Paragraph 1", "Paragraph 2", "..."],
-  "comments": ["Comment 1", "Comment 2", "..."],
-  "videos": ["https://example.com/video.mp4"],
-  "images": ["https://example.com/img1.jpg"],
-  "meta": { "description": "...", "og:title": "..." }
+  "url": "https://example.com",
+  "title": "Example Domain",
+  "text_paragraphs": ["Example Domain This domain is for use in documentation examples..."],
+  "comments": [],
+  "videos": [],
+  "images": [],
+  "meta": { "viewport": "width=device-width, initial-scale=1" }
 }
 ```
 
----
-
-## ⚙️ How It Works
-
-```
-┌────────────┐    ┌───────────────────┐    ┌────────────────┐    ┌──────────────┐
-│  URL +     │ →  │ Playwright renders │ →  │ BeautifulSoup   │ →  │  Structured   │
-│  options   │    │ page in Chromium   │    │ parses HTML/DOM │    │  results      │
-└────────────┘    └───────────────────┘    └────────────────┘    └──────────────┘
-```
-
-- **Fetch layer** (`browser_fetch`) — launches headless Chromium, injects cookies and anti-detection patches, waits for rendering, then pulls HTML, plain text, and video links
-- **Parse layer** (`parse_content`) — uses BeautifulSoup + lxml to extract body text, comments, images, and metadata from the rendered HTML
-- **UI layer** (`ScraperApp`) — Tkinter GUI; scraping runs on a background thread and communicates with the main thread via a queue, so the interface never freezes
+When using the web UI, the results are displayed across tabs (Text / Comments / Videos / Images / Meta / Log) and can be exported to TXT or JSON.
 
 ---
 
-## ⚠️ Usage Notice
+## Notes & Responsible Use
 
-- Only scrape content you're **authorized to access** — public pages, your own sites, or sites whose terms permit automated access.
-- Check each target site's `robots.txt` and terms of service, and keep your request rate reasonable — don't use this for high-volume, high-frequency scraping.
-- Do not use it against pages requiring authentication, or containing private/sensitive personal data, without proper authorization.
-- The built-in anti-detection features only mask common automation fingerprints — they are **not** designed and should **not** be used to defeat enterprise bot-mitigation systems (Cloudflare, DataDome, PerimeterX, etc.) or CAPTCHAs.
-- The cookie feature is meant only for carrying your own session state, not for accessing other people's accounts.
-- Intended for learning and legitimate personal use. Users are solely responsible for any consequences arising from misuse.
+- Only scrape content you are authorized to access. Respect `robots.txt` and website terms of service.
+- This tool is for learning and limited, legitimate uses — it is not intended to bypass strong anti-bot protections or CAPTCHAs.
+- Use the `cookie` option only to carry your own session state; do not use others' credentials.
 
 ---
 
-## 🛠 Tech Stack
+## Troubleshooting
 
-| Component | Purpose |
-|---|---|
-| [Playwright](https://playwright.dev/python/) | Headless browser automation, JS-rendered pages |
-| [playwright-stealth](https://pypi.org/project/playwright-stealth/) *(optional)* | Reduces common automation fingerprints |
-| [BeautifulSoup4](https://www.crummy.com/software/BeautifulSoup/) + `lxml` | HTML parsing and content extraction |
-| Tkinter | Desktop GUI |
+- If Playwright fails to launch, ensure the browser binaries were installed with `python -m playwright install chromium`.
+- If you get frequent 500 errors, check for competing processes on port 8000 (use `netstat -ano | findstr :8000` on Windows) and ensure only one server instance is running.
+- On headless servers, prefer the API/web UI usage and avoid starting the Tkinter GUI.
 
 ---
 
-## 📄 License
+## License
 
-Open-sourced under the [MIT License](LICENSE). Feel free to use and modify it.
+This project is open-sourced under the MIT License. See `LICENSE`.
 
-## 🤝 Contributing
+---
 
-Issues and pull requests are welcome — especially better content-extraction rules or support for more site layouts.
+If you want, I can also:
+
+- Commit these README changes to git, or
+- Translate `README.md` into Chinese or another language.

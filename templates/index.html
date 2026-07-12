@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Modern Web Scraper</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/css/style.css" />
+</head>
+<body>
+  <div class="bg-mesh"></div>
+
+  <header class="header">
+    <div class="header-inner">
+      <div class="brand">
+        <div class="brand-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="3"/>
+            <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/>
+          </svg>
+        </div>
+        <div>
+          <h1>Modern Web Scraper</h1>
+          <p class="subtitle">Playwright real-browser engine · supports JS / SPA / lazy-loading</p>
+        </div>
+      </div>
+      <div class="header-badge">
+        <span class="pulse-dot"></span>
+        Chromium Ready
+      </div>
+    </div>
+  </header>
+
+  <main class="container">
+    <!-- URL Input -->
+    <section class="card url-card">
+      <label class="field-label" for="url-input">Target URL</label>
+      <div class="url-row">
+        <div class="input-wrap">
+          <svg class="input-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/>
+            <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>
+          </svg>
+          <input id="url-input" type="url" placeholder="https://example.com/article" autocomplete="url" />
+        </div>
+        <button id="scrape-btn" class="btn btn-primary">
+          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+          Start Scrape
+        </button>
+      </div>
+      <div id="progress-bar" class="progress-bar hidden">
+        <div class="progress-fill"></div>
+      </div>
+    </section>
+
+    <!-- Options -->
+    <section class="card options-card">
+      <button class="options-toggle" id="options-toggle" aria-expanded="false">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="12" r="3"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>
+        </svg>
+        Advanced Options
+        <svg class="chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>
+      </button>
+      <div class="options-body" id="options-body">
+        <div class="options-grid">
+          <div class="field">
+            <label for="text-sel">Text selector (CSS)</label>
+            <input id="text-sel" type="text" placeholder="Leave empty for auto-detection" />
+          </div>
+          <div class="field">
+            <label for="comment-sel">Comment selector (CSS)</label>
+            <input id="comment-sel" type="text" placeholder="Leave empty for heuristic detection" />
+          </div>
+          <div class="field field-full">
+            <label for="cookie">Cookie (optional)</label>
+            <input id="cookie" type="password" placeholder="key1=value1; key2=value2" />
+          </div>
+          <div class="field">
+            <label for="wait-ms">JS wait (ms)</label>
+            <input id="wait-ms" type="number" value="2500" min="500" max="12000" step="500" />
+          </div>
+          <div class="field field-check">
+            <label class="checkbox-label">
+              <input id="scroll" type="checkbox" checked />
+              <span class="checkmark"></span>
+              Auto-scroll (trigger lazy-loaded content)
+            </label>
+          </div>
+        </div>
+        <p class="tip">Tip: Leave selectors empty to auto-detect the content area. For slow React/Vue SPAs, increase the JS wait time. Anti-detection patches (UA/viewport rotation, fingerprint hiding) are applied automatically each run.</p>
+      </div>
+    </section>
+
+    <!-- Results -->
+    <section class="card results-card">
+      <div class="results-header">
+        <div class="tabs" role="tablist">
+          <button class="tab active" data-tab="text" role="tab">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+            Text
+            <span class="tab-count" id="count-text">0</span>
+          </button>
+          <button class="tab" data-tab="comments" role="tab">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+            Comments
+            <span class="tab-count" id="count-comments">0</span>
+          </button>
+          <button class="tab" data-tab="videos" role="tab">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>
+            Videos
+            <span class="tab-count" id="count-videos">0</span>
+          </button>
+          <button class="tab" data-tab="images" role="tab">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+            Images
+            <span class="tab-count" id="count-images">0</span>
+          </button>
+          <button class="tab" data-tab="meta" role="tab">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg>
+            Metadata
+          </button>
+          <button class="tab" data-tab="log" role="tab">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+            Log
+          </button>
+        </div>
+        <div class="actions">
+          <button class="btn btn-ghost btn-sm" id="save-txt" disabled>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
+            Export TXT
+          </button>
+          <button class="btn btn-ghost btn-sm" id="save-json" disabled>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+            Export JSON
+          </button>
+          <button class="btn btn-ghost btn-sm" id="clear-btn">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+            Clear
+          </button>
+        </div>
+      </div>
+
+      <div class="tab-panels">
+        <div class="tab-panel active" id="panel-text" role="tabpanel">
+          <div class="empty-state" id="empty-text">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+            <p>Enter a URL and click 'Start Scrape'</p>
+          </div>
+          <div class="content-list" id="content-text"></div>
+        </div>
+        <div class="tab-panel" id="panel-comments" role="tabpanel">
+          <div class="content-list" id="content-comments"></div>
+        </div>
+        <div class="tab-panel" id="panel-videos" role="tabpanel">
+          <div class="link-list" id="content-videos"></div>
+        </div>
+        <div class="tab-panel" id="panel-images" role="tabpanel">
+          <div class="image-grid" id="content-images"></div>
+        </div>
+        <div class="tab-panel" id="panel-meta" role="tabpanel">
+          <pre class="code-block" id="content-meta"></pre>
+        </div>
+        <div class="tab-panel" id="panel-log" role="tabpanel">
+          <pre class="log-block" id="content-log"></pre>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <span id="status-text">Ready</span>
+    <span>For learning and research only · please follow target site's robots.txt and terms of service</span>
+  </footer>
+
+  <script src="/static/js/app.js"></script>
+</body>
+</html>

@@ -27,347 +27,39 @@ Notes on responsible use:
 
 import json
 import queue
-import random
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
 
-from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright
-
-try:
-    from playwright_stealth import stealth_sync
-    HAS_STEALTH = True
-except ImportError:
-    HAS_STEALTH = False
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Constants
-# ─────────────────────────────────────────────────────────────────────────────
-
-COMMENT_HINTS = [
-    "comment", "comments", "reply", "replies", "discuss",
-    "review", "feedback", "danmu",
-]
-VIDEO_EXTS = (".mp4", ".m3u8", ".flv", ".webm", ".mov", ".avi")
-IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg")
-
-COMMON_CONTENT_SELECTORS = [
-    "#cnblogs_post_body",
-    ".postBody", ".post_body",
-    "#article_content", ".article-content", ".article__content",
-    ".entry-content", ".post-content", ".post-body",
-    "#js_content",
-    ".markdown-body",
-    "#content_views",
-    ".content-detail", ".detail-content",
-    "article", "main",
-]
-
-SIDEBAR_HINTS = [
-    "sidebar", "side-bar", "aside", "nav", "menu", "footer", "header",
-    "recommend", "related", "hot", "rank", "paihang", "tuijian",
-    "widget", "banner", "advert", "ad-", "breadcrumb", "toc",
-    "share", "social", "tag-list", "catalog",
-]
-
-# A small pool of realistic, common desktop UAs to rotate through.
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-]
-
-VIEWPORTS = [
-    {"width": 1280, "height": 900},
-    {"width": 1366, "height": 768},
-    {"width": 1440, "height": 900},
-    {"width": 1536, "height": 864},
-]
-
-# Manual fallback stealth script (used if playwright-stealth isn't installed).
-# Patches the most commonly checked automation fingerprints.
-STEALTH_JS = """
-Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-window.chrome = window.chrome || { runtime: {} };
-const originalQuery = window.navigator.permissions.query;
-window.navigator.permissions.query = (parameters) => (
-    parameters.name === 'notifications'
-        ? Promise.resolve({ state: Notification.permission })
-        : originalQuery(parameters)
-);
-"""
-
-
-def _is_sidebar(tag) -> bool:
-    cls = " ".join(tag.get("class") or []) + " " + (tag.get("id") or "")
-    cls = cls.lower()
-    return any(h in cls for h in SIDEBAR_HINTS)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Scraping pipeline
-# ─────────────────────────────────────────────────────────────────────────────
-
-def browser_fetch(url: str, wait_ms: int, cookie: str,
-                  scroll: bool, log_q: queue.Queue) -> dict:
-    def log(msg: str):
-        log_q.put(("log", msg))
-
-    log("[Browser] Launching Chromium …")
-
-    with sync_playwright() as pw:
-        # A couple of flags that reduce obvious "this is automation" signals.
-        browser = pw.chromium.launch(
-            headless=True,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-            ],
-        )
-
-        ua = random.choice(USER_AGENTS)
-        viewport = random.choice(VIEWPORTS)
-
-        ctx = browser.new_context(
-            user_agent=ua,
-            viewport=viewport,
-            locale="en-US",
-            extra_http_headers={
-                "Accept-Language": "en-US,en;q=0.9",
-            },
-        )
-
-        # Apply stealth patches to every page created in this context.
-        if HAS_STEALTH:
-            log("[Browser] Applying playwright-stealth patches …")
-        else:
-            log("[Browser] playwright-stealth not installed — using built-in "
-                "fallback patches (pip install playwright-stealth for more).")
-        ctx.add_init_script(STEALTH_JS)
-
-        if cookie.strip():
-            parsed = urlparse(url)
-            domain = parsed.netloc
-            cookies = []
-            for part in cookie.split(";"):
-                part = part.strip()
-                if "=" in part:
-                    name, _, val = part.partition("=")
-                    cookies.append({
-                        "name": name.strip(),
-                        "value": val.strip(),
-                        "domain": domain,
-                        "path": "/",
-                    })
-            if cookies:
-                ctx.add_cookies(cookies)
-                log(f"[Browser] Injected {len(cookies)} cookie(s).")
-
-        page = ctx.new_page()
-        if HAS_STEALTH:
-            stealth_sync(page)
-
-        log(f"[Browser] Navigating to {url} …")
-        page.goto(url, wait_until="domcontentloaded", timeout=30_000)
-
-        if scroll:
-            log("[Browser] Scrolling page to trigger lazy-loaded content …")
-            for _ in range(4):
-                page.evaluate("window.scrollBy(0, document.body.scrollHeight / 4)")
-                # Randomized pause between scrolls instead of a fixed
-                # interval — looks less like a scripted loop.
-                page.wait_for_timeout(random.randint(350, 750))
-            page.evaluate("window.scrollTo(0, 0)")
-
-        # Randomize the settle wait a bit around the requested value so
-        # timing isn't perfectly uniform across runs.
-        jittered_wait = max(200, int(wait_ms * random.uniform(0.85, 1.15)))
-        log(f"[Browser] Waiting ~{jittered_wait} ms for JavaScript to settle …")
-        page.wait_for_timeout(jittered_wait)
-
-        html  = page.content()
-        title = page.title()
-        inner = page.evaluate("document.body.innerText")
-
-        video_urls = list(page.evaluate("""
-            () => {
-                const vids = [];
-                document.querySelectorAll('video, video source').forEach(el => {
-                    if (el.src) vids.push(el.src);
-                    if (el.currentSrc) vids.push(el.currentSrc);
-                });
-                document.querySelectorAll('iframe').forEach(el => {
-                    const s = el.src || '';
-                    if (s && (s.includes('video') || s.includes('player') ||
-                              s.includes('embed') || s.includes('youtube') ||
-                              s.includes('bilibili') || s.includes('vimeo'))) {
-                        vids.push(s);
-                    }
-                });
-                return [...new Set(vids.filter(Boolean))];
-            }
-        """))
-
-        browser.close()
-        log(f"[Browser] Done. Title: {title!r}")
-
-    return {
-        "html": html,
-        "inner_text": inner,
-        "title": title,
-        "url": url,
-        "video_urls_from_dom": video_urls,
-    }
-
-
-def parse_content(data: dict, text_sel: str, comment_sel: str) -> dict:
-    soup    = BeautifulSoup(data["html"], "lxml")
-    base    = data["url"]
-    title   = data["title"] or _bs_title(soup)
-
-    paragraphs = _extract_text(soup, text_sel)
-    comments = _extract_comments(soup, comment_sel)
-
-    videos = list(data["video_urls_from_dom"])
-    for a in soup.find_all("a", href=True):
-        if a["href"].lower().endswith(VIDEO_EXTS):
-            videos.append(urljoin(base, a["href"]))
-    videos = _dedup(videos)
-
-    images = []
-    for img in soup.find_all("img", src=True):
-        src = urljoin(base, img["src"])
-        if src not in images:
-            images.append(src)
-    images = images[:50]
-
-    meta = {}
-    for tag in soup.find_all("meta"):
-        name = tag.get("name") or tag.get("property") or ""
-        content = tag.get("content", "")
-        if name and content:
-            meta[name] = content
-
-    return {
-        "url": base,
-        "title": title,
-        "text_paragraphs": paragraphs,
-        "comments": comments,
-        "videos": videos,
-        "images": images,
-        "meta": meta,
-    }
-
-
-def _bs_title(soup: BeautifulSoup) -> str:
-    if soup.title and soup.title.string:
-        return soup.title.string.strip()
-    h1 = soup.find("h1")
-    return h1.get_text(strip=True) if h1 else "(no title)"
-
-
-def _extract_text(soup: BeautifulSoup, sel: str) -> list:
-    if sel:
-        nodes = soup.select(sel)
-        result = [n.get_text(strip=True, separator=" ") for n in nodes if n.get_text(strip=True)]
-        if result:
-            return result
-
-    container = None
-    for css in COMMON_CONTENT_SELECTORS:
-        node = soup.select_one(css)
-        if node and len(node.get_text(strip=True)) > 200:
-            container = node
-            break
-    if container is None:
-        container = soup.find("article") or soup
-
-    paras = [p.get_text(strip=True, separator=" ")
-             for p in container.find_all(["p", "h2", "h3", "h4", "h5",
-                                           "li", "pre", "code", "blockquote"])
-             if len(p.get_text(strip=True)) > 1 and not _is_sidebar(p)]
-
-    if len(paras) < 3:
-        seen, paras = set(), []
-        for div in container.find_all("div"):
-            if _is_sidebar(div):
-                continue
-            t = div.get_text(strip=True, separator=" ")
-            if len(t) > 50 and t not in seen:
-                seen.add(t)
-                paras.append(t)
-        paras = paras[:60]
-
-    return paras
-
-
-def _extract_comments(soup: BeautifulSoup, sel: str) -> list:
-    if sel:
-        return [n.get_text(strip=True, separator=" ")
-                for n in soup.select(sel) if n.get_text(strip=True)]
-
-    seen, results = set(), []
-    for tag in soup.find_all(["div", "li", "section"]):
-        if _is_sidebar(tag):
-            continue
-        cls = " ".join(tag.get("class") or []) + " " + (tag.get("id") or "")
-        if any(h in cls.lower() for h in COMMENT_HINTS):
-            txt = tag.get_text(strip=True, separator=" ")
-            if txt and 5 < len(txt) < 2000 and txt not in seen:
-                seen.add(txt)
-                results.append(txt)
-    return results[:200]
-
-
-def _dedup(lst: list) -> list:
-    seen, out = set(), []
-    for x in lst:
-        if x not in seen:
-            seen.add(x)
-            out.append(x)
-    return out
-
-
-def run_pipeline(url: str, text_sel: str, comment_sel: str,
-                 cookie: str, wait_ms: int, scroll: bool,
-                 log_q: queue.Queue):
-    try:
-        raw    = browser_fetch(url, wait_ms, cookie, scroll, log_q)
-        result = parse_content(raw, text_sel, comment_sel)
-        log_q.put(("done", result))
-    except Exception as exc:
-        log_q.put(("error", str(exc)))
+from scraper_core import run_pipeline
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # GUI — Light / White theme
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Palette — clean, white-based, soft accents (Notion / Linear inspired)
-BG        = "#FFFFFF"   # main window background
+# Palette — modern, sophisticated design with better visual hierarchy
+BG        = "#F8FAFC"   # main window background (soft blue-gray)
 PANEL     = "#FFFFFF"   # text widget background
-CARD      = "#F7F8FA"   # card / grouped-section background
-CARD_BD   = "#E5E7EB"   # card border
+CARD      = "#FFFFFF"   # card background
+CARD_BD   = "#E2E8F0"   # card border
 INPUT_BG  = "#FFFFFF"
-INPUT_BD  = "#D8DCE3"
-ACCENT    = "#4F6BF6"   # primary blue
-ACCENT_HV = "#3D56D9"
-ACCENT_SOFT = "#EEF1FE"
-FG        = "#000000"   # main text (pure black for max readability)
-DIM       = "#2B2F36"   # secondary text (dark, near-black instead of light gray)
-SUCCESS   = "#1E9E5A"
-ERR       = "#E5484D"
-MONO      = ("Consolas", 9)
+INPUT_BD  = "#CBD5E1"
+ACCENT    = "#6366F1"   # primary indigo (modern, vibrant)
+ACCENT_HV = "#4F46E5"   # hover state
+ACCENT_SOFT = "#EEF2FF"
+ACCENT_GLOW = "#C7D2FE"
+FG        = "#0F172A"   # main text (slate-900)
+DIM       = "#64748B"   # secondary text (slate-500)
+SUCCESS   = "#10B981"   # emerald green
+ERR       = "#EF4444"   # red
+WARN      = "#F59E0B"   # amber
+SHADOW    = "#64748B"   # shadow color
+MONO      = ("JetBrains Mono", 9)
 UI        = ("Segoe UI", 10)
 BOLD      = ("Segoe UI Semibold", 10)
-H1        = ("Segoe UI Semibold", 15)
+H1        = ("Segoe UI Semibold", 16)
 LABEL_F   = ("Segoe UI", 9)
 
 
@@ -402,37 +94,39 @@ class ScraperApp(tk.Tk):
         s.configure("H1.TLabel", background=BG, foreground=FG, font=H1)
         s.configure("Sub.TLabel", background=BG, foreground=DIM, font=("Segoe UI", 9))
 
-        # Entries — soft border, white fill
+        # Entries — refined with better focus states
         s.configure("TEntry", fieldbackground=INPUT_BG, foreground=FG,
-                    insertcolor=FG, bordercolor=INPUT_BD,
-                    lightcolor=INPUT_BD, darkcolor=INPUT_BD, padding=6)
+                    insertcolor=ACCENT, bordercolor=INPUT_BD,
+                    lightcolor=INPUT_BD, darkcolor=INPUT_BD, padding=8)
         s.map("TEntry",
-              bordercolor=[("focus", ACCENT)],
-              lightcolor=[("focus", ACCENT)],
-              darkcolor=[("focus", ACCENT)])
+              bordercolor=[("focus", ACCENT), ("!focus", INPUT_BD)],
+              lightcolor=[("focus", ACCENT_GLOW), ("!focus", INPUT_BD)],
+              darkcolor=[("focus", ACCENT), ("!focus", INPUT_BD)],
+              fieldbackground=[("focus", "#FFFFFF"), ("!focus", INPUT_BG)])
 
-        # Primary button — accent blue
+        # Primary button — modern indigo with better hover states
         s.configure("Primary.TButton", background=ACCENT, foreground="#FFFFFF",
-                    font=BOLD, padding=(18, 9), borderwidth=0, relief="flat")
+                    font=BOLD, padding=(20, 10), borderwidth=0, relief="flat")
         s.map("Primary.TButton",
-              background=[("active", ACCENT_HV), ("disabled", "#C7CDF7")],
+              background=[("active", ACCENT_HV), ("pressed", ACCENT_HV), ("disabled", "#A5B4FC")],
               foreground=[("disabled", "#FFFFFF")])
 
-        # Secondary / ghost button — light card look
+        # Secondary / ghost button — refined with subtle hover
         s.configure("Ghost.TButton", background=CARD, foreground=FG,
-                    font=UI, padding=(12, 6), borderwidth=1,
+                    font=UI, padding=(14, 8), borderwidth=1,
                     bordercolor=CARD_BD, relief="flat")
         s.map("Ghost.TButton",
-              background=[("active", "#EDEFF3")],
-              bordercolor=[("active", CARD_BD)])
+              background=[("active", "#F1F5F9"), ("pressed", "#E2E8F0")],
+              bordercolor=[("active", ACCENT), ("pressed", ACCENT)],
+              foreground=[("active", ACCENT), ("pressed", ACCENT_HV)])
 
-        # Tabs
+        # Tabs — modern design with better selection states
         s.configure("TNotebook", background=BG, borderwidth=0)
-        s.configure("TNotebook.Tab", background=CARD, foreground=FG,
-                    padding=(16, 8), font=UI, borderwidth=0)
+        s.configure("TNotebook.Tab", background=CARD, foreground=DIM,
+                    padding=(18, 10), font=UI, borderwidth=0)
         s.map("TNotebook.Tab",
-              background=[("selected", BG)],
-              foreground=[("selected", ACCENT)])
+              background=[("selected", BG), ("active", ACCENT_SOFT)],
+              foreground=[("selected", ACCENT), ("active", ACCENT_HV)])
         s.layout("TNotebook.Tab", s.layout("TNotebook.Tab"))  # keep default layout
 
         # Group box (Options card)
@@ -440,18 +134,22 @@ class ScraperApp(tk.Tk):
         s.configure("TLabelframe.Label", background=BG, foreground=FG, font=LABEL_F)
 
         s.configure("TCheckbutton", background=BG, foreground=FG, font=UI)
-        s.map("TCheckbutton", background=[("active", BG)])
+        s.map("TCheckbutton", 
+              background=[("active", BG)],
+              foreground=[("active", ACCENT)])
 
-        s.configure("TProgressbar", troughcolor=CARD, background=ACCENT,
-                    borderwidth=0, thickness=4)
+        s.configure("TProgressbar", troughcolor=ACCENT_SOFT, background=ACCENT,
+                    borderwidth=0, thickness=6)
         s.configure("TSeparator", background=CARD_BD)
 
         s.configure("TSpinbox", fieldbackground=INPUT_BG, foreground=FG,
                     background=INPUT_BG, bordercolor=INPUT_BD,
-                    arrowcolor=FG, insertcolor=FG, padding=4)
+                    arrowcolor=DIM, insertcolor=ACCENT, padding=6)
         s.map("TSpinbox",
-              fieldbackground=[("readonly", INPUT_BG)],
-              background=[("active", CARD)])
+              fieldbackground=[("readonly", INPUT_BG), ("focus", INPUT_BG)],
+              background=[("active", CARD)],
+              bordercolor=[("focus", ACCENT), ("!focus", INPUT_BD)],
+              arrowcolor=[("focus", ACCENT), ("!focus", DIM)])
 
     # ── Layout ─────────────────────────────────────────────────────────────
     def _build(self):
@@ -459,28 +157,28 @@ class ScraperApp(tk.Tk):
 
         # ── Header ──────────────────────────────────────────────
         hdr = ttk.Frame(self)
-        hdr.pack(fill="x", padx=18, pady=(18, 4))
+        hdr.pack(fill="x", padx=18, pady=(20, 6))
 
         title_row = ttk.Frame(hdr)
         title_row.pack(fill="x")
         tk.Label(title_row, text="🕷", bg=BG, fg=ACCENT,
-                 font=("Segoe UI", 18)).pack(side="left")
+                 font=("Segoe UI", 20)).pack(side="left")
         tk.Label(title_row, text="  Modern Web Scraper",
                  bg=BG, fg=FG, font=H1).pack(side="left")
         tk.Label(title_row, text="   Real Chromium browser · handles JS / SPAs / lazy-load",
-                 bg=BG, fg=FG, font=("Segoe UI", 9)).pack(side="left", padx=(4, 0))
+                 bg=BG, fg=DIM, font=("Segoe UI", 9)).pack(side="left", padx=(4, 0))
 
         ttk.Separator(self).pack(fill="x", padx=18, pady=(12, 12))
 
         # ── URL input card ──────────────────────────────────────
         url_card = tk.Frame(self, bg=CARD, highlightbackground=CARD_BD,
                              highlightthickness=1, bd=0)
-        url_card.pack(fill="x", padx=18, pady=(0, 12))
+        url_card.pack(fill="x", padx=18, pady=(0, 16))
         inner = tk.Frame(url_card, bg=CARD)
-        inner.pack(fill="x", padx=14, pady=12)
+        inner.pack(fill="x", padx=16, pady=14)
 
-        tk.Label(inner, text="Target URL", bg=CARD, fg=FG,
-                 font=LABEL_F).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        tk.Label(inner, text="Target URL", bg=CARD, fg=DIM,
+                 font=LABEL_F).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
 
         self.url_var = tk.StringVar()
         url_entry = ttk.Entry(inner, textvariable=self.url_var, font=("Segoe UI", 11))
@@ -495,21 +193,21 @@ class ScraperApp(tk.Tk):
         # ── Options card ────────────────────────────────────────
         opt_card = tk.Frame(self, bg=CARD, highlightbackground=CARD_BD,
                              highlightthickness=1, bd=0)
-        opt_card.pack(fill="x", padx=18, pady=(0, 12))
+        opt_card.pack(fill="x", padx=18, pady=(0, 16))
         opt = tk.Frame(opt_card, bg=CARD)
-        opt.pack(fill="x", padx=14, pady=12)
+        opt.pack(fill="x", padx=16, pady=14)
 
-        tk.Label(opt, text="Advanced Options", bg=CARD, fg=FG,
-                 font=LABEL_F).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 8))
+        tk.Label(opt, text="Advanced Options", bg=CARD, fg=DIM,
+                 font=LABEL_F).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 10))
 
         # Row 1 — selectors
-        tk.Label(opt, text="Text selector (CSS)", bg=CARD, fg=FG,
+        tk.Label(opt, text="Text selector (CSS)", bg=CARD, fg=DIM,
                  font=LABEL_F).grid(row=1, column=0, sticky="w", padx=(0, 6), pady=4)
         self.text_sel_var = tk.StringVar()
         ttk.Entry(opt, textvariable=self.text_sel_var,
                   width=28).grid(row=1, column=1, sticky="we", padx=(0, 24), pady=4, ipady=2)
 
-        tk.Label(opt, text="Comment selector (CSS)", bg=CARD, fg=FG,
+        tk.Label(opt, text="Comment selector (CSS)", bg=CARD, fg=DIM,
                  font=LABEL_F).grid(row=1, column=2, sticky="w", padx=(0, 6), pady=4)
         self.cmt_sel_var = tk.StringVar()
         ttk.Entry(opt, textvariable=self.cmt_sel_var,
@@ -519,7 +217,7 @@ class ScraperApp(tk.Tk):
         opt.columnconfigure(3, weight=1)
 
         # Row 2 — cookie
-        tk.Label(opt, text="Cookie (optional, bypasses anti-bot checks)", bg=CARD, fg=FG,
+        tk.Label(opt, text="Cookie (optional, bypasses anti-bot checks)", bg=CARD, fg=DIM,
                  font=LABEL_F).grid(row=2, column=0, sticky="w", padx=(0, 6), pady=4)
         self.cookie_var = tk.StringVar()
         ttk.Entry(opt, textvariable=self.cookie_var,
@@ -528,9 +226,9 @@ class ScraperApp(tk.Tk):
 
         # Row 3 — JS wait + scroll toggle
         wait_row = tk.Frame(opt, bg=CARD)
-        wait_row.grid(row=3, column=0, columnspan=4, sticky="we", pady=(10, 0))
+        wait_row.grid(row=3, column=0, columnspan=4, sticky="we", pady=(12, 0))
 
-        tk.Label(wait_row, text="JS wait (ms)", bg=CARD, fg=FG,
+        tk.Label(wait_row, text="JS wait (ms)", bg=CARD, fg=DIM,
                  font=LABEL_F).pack(side="left", padx=(0, 8))
         self.wait_var = tk.IntVar(value=2500)
         ttk.Spinbox(wait_row, from_=500, to=12000, increment=500,
@@ -544,9 +242,9 @@ class ScraperApp(tk.Tk):
         tip_text = ("Tip: leave selectors blank for auto-detection. Increase JS wait for slow "
                      "React/Vue SPAs. Stealth patches (UA/viewport rotation, fingerprint "
                      "hiding) are applied automatically on every run.")
-        tk.Label(opt, text=tip_text, bg=CARD, fg=FG, font=("Segoe UI", 8),
+        tk.Label(opt, text=tip_text, bg=CARD, fg=DIM, font=("Segoe UI", 8),
                  wraplength=1000, justify="left").grid(
-            row=4, column=0, columnspan=4, sticky="w", pady=(10, 0))
+            row=4, column=0, columnspan=4, sticky="w", pady=(12, 0))
 
         # ── Progress ────────────────────────────────────────────
         self.prog = ttk.Progressbar(self, mode="indeterminate")
@@ -554,7 +252,7 @@ class ScraperApp(tk.Tk):
         # ── Tabs ────────────────────────────────────────────────
         tabs_wrap = tk.Frame(self, bg=BG, highlightbackground=CARD_BD,
                               highlightthickness=1)
-        tabs_wrap.pack(fill="both", expand=True, padx=18, pady=(0, 6))
+        tabs_wrap.pack(fill="both", expand=True, padx=18, pady=(0, 10))
 
         self.nb = ttk.Notebook(tabs_wrap)
         self.nb.pack(fill="both", expand=True, padx=1, pady=1)
@@ -568,7 +266,7 @@ class ScraperApp(tk.Tk):
 
         # ── Bottom bar ──────────────────────────────────────────
         bar = ttk.Frame(self)
-        bar.pack(fill="x", padx=18, pady=(2, 16))
+        bar.pack(fill="x", padx=18, pady=(4, 18))
 
         for label, cmd in [
             ("💾  Save TXT",  self._save_txt),
@@ -576,11 +274,11 @@ class ScraperApp(tk.Tk):
             ("🗑  Clear",     self._clear),
         ]:
             ttk.Button(bar, text=label, style="Ghost.TButton",
-                       command=cmd).pack(side="left", padx=(0, 8))
+                       command=cmd).pack(side="left", padx=(0, 10))
 
         self.status_var = tk.StringVar(value="Ready.")
         tk.Label(bar, textvariable=self.status_var,
-                 bg=BG, fg=FG, font=("Segoe UI", 9)).pack(side="left", padx=10)
+                 bg=BG, fg=DIM, font=("Segoe UI", 9)).pack(side="left", padx=12)
 
     def _tab(self, label: str) -> scrolledtext.ScrolledText:
         frame = tk.Frame(self.nb, bg=BG)
