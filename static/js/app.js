@@ -226,11 +226,15 @@ function renderResults(r) {
   const metaPreview = {
     url: r.url,
     title: r.title,
+    platform: r.platform,
     text_paragraphs: r.text_paragraphs,
     comments: r.comments,
     videos: r.videos,
     images: r.images,
     meta: r.meta,
+    bilibili: r.bilibili,
+    discovered_selectors: r.discovered_selectors,
+    applied_selectors: r.applied_selectors,
   };
   $("#content-meta").textContent = JSON.stringify(metaPreview, null, 2);
   renderSelectors(r);

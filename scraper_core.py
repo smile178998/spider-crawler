@@ -14,6 +14,7 @@ from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
 from playwright.sync_api import Browser, BrowserContext, Page, Playwright, sync_playwright
+from bilibili_parser import extract_bilibili, is_bilibili_url, merge_bilibili_result
 from selector_engine import SelectorConfig, enhance_with_auto_selectors
 
 try:
@@ -419,7 +420,7 @@ def _create_context(
     return ctx
 
 
-def _extract_page_data(page: Page, url: str) -> dict:
+def _extract_page_data(page: Page, url: str, log: LogFn | None = None) -> dict:
     html = page.content()
     title = page.title()
     inner = page.evaluate("document.body ? document.body.innerText : ''")
@@ -443,13 +444,24 @@ def _extract_page_data(page: Page, url: str) -> dict:
         }
     """))
 
-    return {
+    data = {
         "html": html,
         "inner_text": inner,
         "title": title,
         "url": page.url or url,
         "video_urls_from_dom": video_urls,
     }
+
+    if is_bilibili_url(url):
+        log_fn = log or (lambda _msg: None)
+        log_fn("[Bilibili] Detected video page — extracting metadata and streams ...")
+        bili = extract_bilibili(page, log_fn)
+        if bili:
+            data["bilibili_data"] = bili
+            if bili.get("title"):
+                data["title"] = bili["title"]
+
+    return data
 
 
 def _attempt_fetch(
@@ -498,7 +510,7 @@ def _attempt_fetch(
         log(f"[Browser] Waiting ~{jittered_wait} ms for JavaScript to settle ...")
         page.wait_for_timeout(jittered_wait)
 
-        data = _extract_page_data(page, cfg.url)
+        data = _extract_page_data(page, cfg.url, log)
         log(f"[Browser] Done. Title: {data['title']!r}")
         return data
     finally:
@@ -738,16 +750,20 @@ def run_pipeline(
         raw = browser_fetch(url, wait_ms, cookie, scroll, log_q, **kwargs)
         result = parse_content(raw, text_sel, comment_sel)
 
-        selector_cfg = SelectorConfig(
-            enabled=bool(kwargs.get("auto_selector", True)),
-            use_ai=bool(kwargs.get("auto_selector_ai", True)),
-            ai_api_key=str(kwargs.get("ai_api_key", "")).strip(),
-            ai_base_url=str(kwargs.get("ai_base_url", "")).strip() or "https://api.openai.com/v1",
-            ai_model=str(kwargs.get("ai_model", "")).strip() or "gpt-4o-mini",
-        )
-        result = enhance_with_auto_selectors(
-            raw, result, text_sel, comment_sel, selector_cfg, parse_content, log
-        )
+        if raw.get("bilibili_data"):
+            log("[Bilibili] Merging platform-specific data into results ...")
+            result = merge_bilibili_result(result, raw["bilibili_data"])
+        else:
+            selector_cfg = SelectorConfig(
+                enabled=bool(kwargs.get("auto_selector", True)),
+                use_ai=bool(kwargs.get("auto_selector_ai", True)),
+                ai_api_key=str(kwargs.get("ai_api_key", "")).strip(),
+                ai_base_url=str(kwargs.get("ai_base_url", "")).strip() or "https://api.openai.com/v1",
+                ai_model=str(kwargs.get("ai_model", "")).strip() or "gpt-4o-mini",
+            )
+            result = enhance_with_auto_selectors(
+                raw, result, text_sel, comment_sel, selector_cfg, parse_content, log
+            )
 
         log_q.put(("done", result))
     except Exception as exc:
