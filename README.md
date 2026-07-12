@@ -18,6 +18,13 @@ A Playwright-powered web scraper with a FastAPI web UI. It launches a real Chrom
 - Metadata extraction from `<meta>` tags
 - Export results to TXT or JSON
 
+### Smart auto-selector
+- **Heuristic DOM scoring** — finds main content and comment blocks without manual CSS selectors
+- **Stable CSS generation** — prefers `#id` and semantic classes; skips dynamic hashed classes
+- **AI fallback** — OpenAI-compatible APIs (OpenAI, DeepSeek, Ollama) when heuristics fail
+- **Selector validation** — re-extracts content and keeps the best result
+- **Selectors tab** in the UI — shows method, confidence, and discovered selectors; apply to form with one click
+
 ### Anti-detection & reliability
 - **System Chrome** support (more realistic fingerprint than bundled Chromium)
 - **playwright-stealth** + built-in fingerprint patches (webdriver, WebGL, headers)
@@ -37,8 +44,10 @@ A Playwright-powered web scraper with a FastAPI web UI. It launches a real Chrom
 spaider_crawler/
 ├── app.py              # FastAPI web server + SSE API
 ├── scraper_core.py     # Playwright pipeline + content parsing
+├── selector_engine.py  # Smart CSS selector discovery (heuristic + AI)
 ├── requirements.txt
 ├── payload.json        # Example API request body
+├── .env.example        # AI API key template (copy to .env)
 ├── templates/
 │   └── index.html      # Web UI
 └── static/
@@ -84,6 +93,18 @@ python -m playwright install chromium
 
 > **Tip:** Install [Google Chrome](https://www.google.com/chrome/) on your system and enable **Use system Chrome** in Advanced Options for better fingerprint evasion.
 
+4. (Optional) Configure AI selector fallback — copy `.env.example` to `.env` and set your API key:
+
+```bash
+cp .env.example .env   # Windows: copy .env.example .env
+```
+
+```env
+OPENAI_API_KEY=sk-your-key-here
+# DeepSeek: AI_BASE_URL=https://api.deepseek.com/v1  AI_MODEL=deepseek-chat
+# Ollama:   AI_BASE_URL=http://127.0.0.1:11434/v1   AI_MODEL=llama3.2
+```
+
 ---
 
 ## Quickstart
@@ -117,8 +138,33 @@ python -m uvicorn app:app --host 127.0.0.1 --port 8000 --reload
 | Use system Chrome | Prefer installed Chrome over bundled Chromium |
 | Simulate human | Random mouse movement and scroll behavior |
 | Block resources | Skip images/fonts for speed (may trigger bot detection) |
+| Smart auto-selector | DOM scoring to discover text/comment CSS selectors automatically |
+| Enable AI fallback | Call LLM when heuristics fail (requires API key) |
+| AI API key / base URL / model | Override env vars; supports OpenAI-compatible providers |
 
 **Recommended for protected sites:** Browser mode = **Auto** or **Visible**, enable **Use system Chrome**, add a proxy if IP is blocked.
+
+**Recommended for unknown page layouts:** Leave CSS selectors empty, enable **Smart auto-selector**. Add an API key for hard pages.
+
+---
+
+## Smart auto-selector
+
+When text/comment CSS selectors are empty (or extraction is weak), the engine runs automatically after each scrape:
+
+```
+HTML → DOM scoring → CSS selector generation → validate → re-extract
+                              ↓ (if weak)
+                         AI analysis → new selectors → re-extract
+```
+
+| Method | Description |
+|--------|-------------|
+| `heuristic` | DOM text density, paragraph count, semantic class names |
+| `ai` | LLM analyzes simplified HTML and returns selectors |
+| `hybrid` | Heuristic found partial matches; AI refined the result |
+
+Discovered selectors appear in the **Selectors** tab and in the API response under `discovered_selectors` / `applied_selectors`.
 
 ---
 
@@ -151,7 +197,12 @@ Starts a scrape job. Returns a **Server-Sent Events (SSE)** stream.
   "headless": "auto",
   "max_retries": 2,
   "simulate_human": true,
-  "block_resources": false
+  "block_resources": false,
+  "auto_selector": true,
+  "auto_selector_ai": true,
+  "ai_api_key": "",
+  "ai_base_url": "",
+  "ai_model": ""
 }
 ```
 
@@ -169,6 +220,11 @@ Starts a scrape job. Returns a **Server-Sent Events (SSE)** stream.
 | `max_retries` | int | `2` | Max retry attempts (0–4) |
 | `simulate_human` | bool | `true` | Simulate mouse/scroll behavior |
 | `block_resources` | bool | `false` | Block images/fonts/styles |
+| `auto_selector` | bool | `true` | Enable smart CSS selector discovery |
+| `auto_selector_ai` | bool | `true` | Use AI when heuristics fail |
+| `ai_api_key` | string | `""` | API key (falls back to `OPENAI_API_KEY` env) |
+| `ai_base_url` | string | `""` | API base URL (default: OpenAI) |
+| `ai_model` | string | `""` | Model name (default: `gpt-4o-mini`) |
 
 **SSE events:**
 
@@ -231,11 +287,22 @@ After a successful scrape, the `done` event contains:
   "comments": [],
   "videos": [],
   "images": [],
-  "meta": { "viewport": "width=device-width, initial-scale=1" }
+  "meta": { "viewport": "width=device-width, initial-scale=1" },
+  "discovered_selectors": {
+    "text_selector": "article.main-content",
+    "comment_selector": "div.comments-section .comment-item",
+    "method": "heuristic",
+    "confidence": 0.85,
+    "reasoning": ""
+  },
+  "applied_selectors": {
+    "text_selector": "article.main-content",
+    "comment_selector": "div.comments-section .comment-item"
+  }
 }
 ```
 
-Results are displayed across tabs (Text / Comments / Videos / Images / Metadata / Log) and can be exported to TXT or JSON.
+Results are displayed across tabs (Text / Comments / Videos / Images / **Selectors** / Metadata / Log) and can be exported to TXT or JSON.
 
 ---
 
@@ -265,6 +332,9 @@ CMD ["python", "-m", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"
 | Empty content on SPA | Increase JS wait time; enable auto-scroll |
 | CAPTCHA appears | Switch to **Visible** mode and solve manually |
 | System Chrome not found | Uncheck **Use system Chrome** or install Chrome |
+| Wrong content extracted | Leave selectors empty; enable **Smart auto-selector** |
+| AI selector not triggered | Set `OPENAI_API_KEY` in `.env` or paste key in UI |
+| AI request fails | Check `ai_base_url` / `ai_model`; verify provider compatibility |
 
 ---
 
