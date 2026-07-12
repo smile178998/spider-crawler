@@ -1,10 +1,6 @@
-# 🕷 Modern Web Scraper
+# Modern Web Scraper
 
-
-This repository contains a Playwright-powered web scraper with a web user interface served by FastAPI (access at `http://localhost:8000/`) implemented in `app.py` + `templates/` + `static/`.
-
-The core pipeline (`scraper_core.py`) launches a real Chromium browser (via Playwright), renders the page, and extracts structured data (body text, comments, video links, images, and meta tags).
-
+A Playwright-powered web scraper with a FastAPI web UI. It launches a real Chromium/Chrome browser, renders JavaScript-heavy pages, and extracts structured content (body text, comments, videos, images, and metadata).
 
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue) ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey) ![License](https://img.shields.io/badge/license-MIT-green)
 
@@ -12,18 +8,43 @@ The core pipeline (`scraper_core.py`) launches a real Chromium browser (via Play
 
 ![Screenshot](image.png)
 
-
 ## Features
 
-- Real Chromium rendering (Playwright) — executes JavaScript and supports SPAs
-- Body text auto-detection + optional CSS selector override
+### Content extraction
+- Real browser rendering (Playwright) — supports JS, SPAs, and lazy-loaded content
+- Auto-detect body text + optional CSS selector override
 - Heuristic comment extraction + optional CSS selector override
-- Video and image link extraction
+- Video and image link extraction (including lazy-load attributes like `data-src`)
 - Metadata extraction from `<meta>` tags
-- Cookie injection to carry session state
-- Lightweight anti-detection patches (built-in + optional `playwright-stealth`)
-- Auto-scroll to trigger lazy-loaded content
 - Export results to TXT or JSON
+
+### Anti-detection & reliability
+- **System Chrome** support (more realistic fingerprint than bundled Chromium)
+- **playwright-stealth** + built-in fingerprint patches (webdriver, WebGL, headers)
+- Randomized browser profiles (UA, viewport, locale, timezone)
+- Human-like behavior simulation (mouse movement, scrolling)
+- Cloudflare / WAF challenge page detection with auto-wait
+- Multi-strategy retry: headless → extended wait → visible browser fallback
+- HTTP/SOCKS5 **proxy** support (with optional auth)
+- Cookie injection for authenticated sessions
+- Configurable JS wait time and auto-scroll
+
+---
+
+## Project structure
+
+```
+spaider_crawler/
+├── app.py              # FastAPI web server + SSE API
+├── scraper_core.py     # Playwright pipeline + content parsing
+├── requirements.txt
+├── payload.json        # Example API request body
+├── templates/
+│   └── index.html      # Web UI
+└── static/
+    ├── css/style.css
+    └── js/app.js
+```
 
 ---
 
@@ -31,7 +52,7 @@ The core pipeline (`scraper_core.py`) launches a real Chromium browser (via Play
 
 - Python 3.10+
 - `pip` and a writable Python environment
-- For the GUI: a display environment (Tkinter) — on headless servers prefer the web UI
+- Google Chrome (optional, recommended for stronger anti-detection)
 
 Dependencies are listed in `requirements.txt`.
 
@@ -55,82 +76,152 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-3. Install Playwright browser binaries (required for Playwright to run):
+3. Install Playwright browser binaries:
 
 ```bash
 python -m playwright install chromium
 ```
 
-Notes:
-- `playwright-stealth` is optional — the code falls back to a small built-in patch when it's not available.
-- On Linux, you may need system packages for Chromium to run (fonts, libgtk, etc.).
+> **Tip:** Install [Google Chrome](https://www.google.com/chrome/) on your system and enable **Use system Chrome** in Advanced Options for better fingerprint evasion.
 
 ---
 
 ## Quickstart
 
-After installing requirements and Playwright binaries, start the web UI:
+Start the web UI:
 
 ```bash
 python app.py
-# or
-python -m uvicorn app:app --host 127.0.0.1 --port 8000 --reload
 ```
 
-Open your browser at `http://127.0.0.1:8000/` and enter a URL to scrape.
+Open `http://127.0.0.1:8000/` in your browser, enter a URL, and click **Start Scrape**.
 
----
-
-## Optional: Docker (experimental)
-
-You can run the web UI inside a container. This repo does not include an official Dockerfile, but a minimal example:
-
-```dockerfile
-FROM python:3.11-slim
-WORKDIR /app
-COPY . /app
-RUN pip install --no-cache-dir -r requirements.txt
-RUN python -m playwright install chromium
-EXPOSE 8000
-CMD ["python", "-m", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
-```
-
-Notes for Docker:
-- Use a non-root user and ensure required system libraries are installed for Chromium (fonts, GTK, etc.).
-- Containers running Playwright may need extra flags or capabilities depending on the host environment.
-
----
-
-## Run the Web UI (FastAPI)
-
-Start the server (development):
+Or run with uvicorn directly:
 
 ```bash
-python app.py
-# or with uvicorn directly
 python -m uvicorn app:app --host 127.0.0.1 --port 8000 --reload
 ```
 
-Open `http://127.0.0.1:8000/` in your browser. The web UI mirrors the desktop GUI: enter a URL, configure optional selectors/cookie/wait time/scroll, and click `Start Scrape`.
-
-You can also call the API programmatically (`POST /api/scrape`) — it returns a Server-Sent Events (SSE) stream of logs and a final `done` event containing the JSON result.
-
-Example (PowerShell):
-
-```powershell
-Invoke-WebRequest -Uri http://127.0.0.1:8000/api/scrape -Method Post -Body '{"url":"https://example.com","text_selector":"","comment_selector":"","cookie":"","wait_ms":2500,"scroll":true}' -ContentType "application/json"
-```
-
-Or save the response stream to a file:
-
-```powershell
-Invoke-WebRequest -Uri http://127.0.0.1:8000/api/scrape -Method Post -Body (Get-Content payload.json -Raw) -ContentType "application/json" -OutFile sse_response.txt
-```
 ---
 
-## API Output
+## Web UI options
 
-After a successful scrape the pipeline returns a JSON object similar to:
+| Option | Description |
+|--------|-------------|
+| Text / Comment selector | CSS selectors; leave empty for auto-detection |
+| Cookie | Session cookies (`key1=val1; key2=val2`) |
+| Proxy | `http://host:port` or `socks5://user:pass@host:port` |
+| JS wait (ms) | Time to wait for JavaScript after page load (500–30000) |
+| Browser mode | `Auto` / `Headless only` / `Visible browser` |
+| Max retries | Number of retry attempts with alternate strategies (0–4) |
+| Use system Chrome | Prefer installed Chrome over bundled Chromium |
+| Simulate human | Random mouse movement and scroll behavior |
+| Block resources | Skip images/fonts for speed (may trigger bot detection) |
+
+**Recommended for protected sites:** Browser mode = **Auto** or **Visible**, enable **Use system Chrome**, add a proxy if IP is blocked.
+
+---
+
+## API reference
+
+### `GET /api/health`
+
+Health check.
+
+```json
+{ "status": "ok" }
+```
+
+### `POST /api/scrape`
+
+Starts a scrape job. Returns a **Server-Sent Events (SSE)** stream.
+
+**Request body:**
+
+```json
+{
+  "url": "https://example.com",
+  "text_selector": "",
+  "comment_selector": "",
+  "cookie": "",
+  "proxy": "",
+  "wait_ms": 3500,
+  "scroll": true,
+  "use_chrome": true,
+  "headless": "auto",
+  "max_retries": 2,
+  "simulate_human": true,
+  "block_resources": false
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `url` | string | *required* | Target URL |
+| `text_selector` | string | `""` | CSS selector for body text |
+| `comment_selector` | string | `""` | CSS selector for comments |
+| `cookie` | string | `""` | Cookie string for auth |
+| `proxy` | string | `""` | Proxy server URL |
+| `wait_ms` | int | `3500` | JS settle time (500–30000) |
+| `scroll` | bool | `true` | Auto-scroll for lazy content |
+| `use_chrome` | bool | `true` | Use system Chrome if available |
+| `headless` | string | `"auto"` | `"auto"`, `"hidden"`, or `"visible"` |
+| `max_retries` | int | `2` | Max retry attempts (0–4) |
+| `simulate_human` | bool | `true` | Simulate mouse/scroll behavior |
+| `block_resources` | bool | `false` | Block images/fonts/styles |
+
+**SSE events:**
+
+| Event | Description |
+|-------|-------------|
+| `log` | Progress message |
+| `done` | Final JSON result |
+| `error` | Error message |
+
+**Validation errors** return HTTP `422` with a JSON body:
+
+```json
+{
+  "error": "Invalid request",
+  "details": ["headless: Input should be 'auto', 'hidden' or 'visible'"]
+}
+```
+
+### Example (Python)
+
+```python
+import json
+import urllib.request
+
+body = json.dumps({"url": "https://example.com", "headless": "hidden"}).encode()
+req = urllib.request.Request(
+    "http://127.0.0.1:8000/api/scrape",
+    data=body,
+    headers={"Content-Type": "application/json"},
+    method="POST",
+)
+with urllib.request.urlopen(req, timeout=120) as resp:
+    for line in resp.read().decode().splitlines():
+        if line.startswith("data: "):
+            print(line[6:])
+```
+
+### Example (PowerShell)
+
+```powershell
+Invoke-WebRequest `
+  -Uri http://127.0.0.1:8000/api/scrape `
+  -Method Post `
+  -Body (Get-Content payload.json -Raw) `
+  -ContentType "application/json" `
+  -OutFile sse_response.txt
+```
+
+---
+
+## API output
+
+After a successful scrape, the `done` event contains:
 
 ```json
 {
@@ -144,33 +235,47 @@ After a successful scrape the pipeline returns a JSON object similar to:
 }
 ```
 
-When using the web UI, the results are displayed across tabs (Text / Comments / Videos / Images / Meta / Log) and can be exported to TXT or JSON.
+Results are displayed across tabs (Text / Comments / Videos / Images / Metadata / Log) and can be exported to TXT or JSON.
 
 ---
 
-## Notes & Responsible Use
+## Optional: Docker (experimental)
 
-- Only scrape content you are authorized to access. Respect `robots.txt` and website terms of service.
-- This tool is for learning and limited, legitimate uses — it is not intended to bypass strong anti-bot protections or CAPTCHAs.
-- Use the `cookie` option only to carry your own session state; do not use others' credentials.
+```dockerfile
+FROM python:3.11-slim
+WORKDIR /app
+COPY . /app
+RUN pip install --no-cache-dir -r requirements.txt
+RUN python -m playwright install chromium
+EXPOSE 8000
+CMD ["python", "-m", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+> Containers may need extra system libraries for Chromium (fonts, GTK, etc.) and additional flags depending on the host.
 
 ---
 
 ## Troubleshooting
 
-- If Playwright fails to launch, ensure the browser binaries were installed with `python -m playwright install chromium`.
-- If you get frequent 500 errors, check for competing processes on port 8000 (use `netstat -ano | findstr :8000` on Windows) and ensure only one server instance is running.
-- On headless servers, prefer the API/web UI usage and avoid starting the Tkinter GUI.
+| Problem | Solution |
+|---------|----------|
+| Playwright fails to launch | Run `python -m playwright install chromium` |
+| Port 8000 in use | Stop other processes: `netstat -ano \| findstr :8000` (Windows) |
+| Cloudflare / WAF blocks | Use **Visible** mode + system Chrome + proxy |
+| Empty content on SPA | Increase JS wait time; enable auto-scroll |
+| CAPTCHA appears | Switch to **Visible** mode and solve manually |
+| System Chrome not found | Uncheck **Use system Chrome** or install Chrome |
+
+---
+
+## Notes & responsible use
+
+- Only scrape content you are authorized to access. Respect `robots.txt` and website terms of service.
+- This tool is for learning and legitimate research — it cannot bypass all CAPTCHAs or commercial WAF systems.
+- Use the `cookie` option only for your own session state; never use others' credentials.
 
 ---
 
 ## License
 
-This project is open-sourced under the MIT License. See `LICENSE`.
-
----
-
-If you want, I can also:
-
-- Commit these README changes to git, or
-- Translate `README.md` into Chinese or another language.
+MIT License — see [LICENSE](LICENSE).
