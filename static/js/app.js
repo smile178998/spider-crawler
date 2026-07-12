@@ -204,8 +204,10 @@ function renderResults(r) {
     : `<div class="empty-state"><p>No video links found.</p></div>`;
   $("#count-videos").textContent = r.videos.length;
 
-  $("#content-images").innerHTML = r.images.length
-    ? r.images
+  const displayImages = (r.images || []).map(normalizeImgUrl).filter(Boolean);
+
+  $("#content-images").innerHTML = displayImages.length
+    ? displayImages
         .map(
           (img, i) =>
             `<div class="image-card" data-url="${escAttr(img)}">
@@ -215,7 +217,7 @@ function renderResults(r) {
         )
         .join("")
     : `<div class="empty-state"><p>No images found.</p></div>`;
-  $("#count-images").textContent = r.images.length;
+  $("#count-images").textContent = displayImages.length;
 
   $("#content-images").querySelectorAll(".image-card").forEach((card) => {
     card.addEventListener("click", () => {
@@ -230,7 +232,7 @@ function renderResults(r) {
     text_paragraphs: r.text_paragraphs,
     comments: r.comments,
     videos: r.videos,
-    images: r.images,
+    images: displayImages,
     meta: r.meta,
     bilibili: r.bilibili,
     discovered_selectors: r.discovered_selectors,
@@ -359,6 +361,12 @@ function appendLog(text, cls) {
   span.textContent = text;
   log.appendChild(span);
   log.scrollTop = log.scrollHeight;
+}
+
+function normalizeImgUrl(url) {
+  if (!url) return "";
+  if (url.startsWith("//")) return `https:${url}`;
+  return url;
 }
 
 function esc(text) {

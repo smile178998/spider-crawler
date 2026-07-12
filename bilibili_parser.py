@@ -10,6 +10,8 @@ from urllib.parse import urlparse
 
 from playwright.sync_api import Page
 
+from image_utils import collect_images
+
 LogFn = Callable[[str], None]
 
 _BV_RE = re.compile(r"BV[\w]+", re.I)
@@ -223,15 +225,20 @@ def merge_bilibili_result(result: dict, bili: dict) -> dict:
     existing = result.get("videos") or []
     result["videos"] = list(dict.fromkeys(stream_urls + existing))
 
-    images = list(result.get("images") or [])
+    curated: list[str] = []
     cover = bili.get("cover")
     if cover:
-        images.insert(0, cover)
+        curated.append(cover)
+    owner = bili.get("owner") or {}
+    if owner.get("face"):
+        curated.append(owner["face"])
     for pg in bili.get("pages") or []:
         frame = pg.get("first_frame")
-        if frame and frame not in images:
-            images.append(frame)
-    result["images"] = images[:50]
+        if frame:
+            curated.append(frame)
+
+  # Bilibili pages embed many recommendation thumbnails in HTML — keep only real assets.
+    result["images"] = collect_images(curated, limit=20)
 
     meta = dict(result.get("meta") or {})
     meta.update({

@@ -15,6 +15,7 @@ from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 from playwright.sync_api import Browser, BrowserContext, Page, Playwright, sync_playwright
 from bilibili_parser import extract_bilibili, is_bilibili_url, merge_bilibili_result
+from image_utils import collect_images
 from selector_engine import SelectorConfig, enhance_with_auto_selectors
 
 try:
@@ -632,9 +633,9 @@ def parse_content(data: dict, text_sel: str, comment_sel: str) -> dict:
     images = []
     for img in soup.find_all("img"):
         src = _image_src(img, base)
-        if src and src not in images:
+        if src:
             images.append(src)
-    images = images[:50]
+    images = collect_images(images)
 
     meta = {}
     for tag in soup.find_all("meta"):
