@@ -2,6 +2,8 @@
 
 A Playwright-powered web scraper with a FastAPI web UI. It launches a real Chromium/Chrome browser, renders JavaScript-heavy pages, and extracts structured content (body text, comments, videos, images, and metadata).
 
+**Language / 语言：** **English** | [简体中文](README_zh-CN.md)
+
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue) ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey) ![License](https://img.shields.io/badge/license-MIT-green)
 
 ---
