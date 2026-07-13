@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Scrape a Bilibili video and save JSON. Cookie via BILI_COOKIE env var."""
+"""Scrape a video page (any supported platform) and save JSON."""
 from __future__ import annotations
 
 import json
@@ -15,21 +15,15 @@ from scraper_core import run_pipeline  # noqa: E402
 
 
 def main() -> int:
-    url = sys.argv[1] if len(sys.argv) > 1 else "https://www.bilibili.com/video/BV1yk7X6KEz4"
-    out = Path(sys.argv[2]) if len(sys.argv) > 2 else ROOT / "output_bilibili.json"
+    url = (
+        sys.argv[1]
+        if len(sys.argv) > 1
+        else "https://www.bilibili.com/video/BV1yk7X6KEz4"
+    )
+    out = Path(sys.argv[2]) if len(sys.argv) > 2 else ROOT / "output_video.json"
     cookie = os.environ.get("BILI_COOKIE", "").strip()
 
-    if not cookie:
-        print("Set BILI_COOKIE environment variable with your login cookie.", file=sys.stderr)
-        return 1
-
     log_q: queue.Queue = queue.Queue()
-
-    def drain():
-        while not log_q.empty():
-            kind, payload = log_q.get_nowait()
-            if kind == "log":
-                print(payload)
 
     run_pipeline(
         url,
@@ -46,6 +40,7 @@ def main() -> int:
         auto_selector=False,
         auto_selector_ai=False,
         download_media=True,
+        use_saved_profile=not cookie,
     )
 
     result = None
@@ -67,19 +62,17 @@ def main() -> int:
         return 1
 
     out.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-    bili = result.get("bilibili") or {}
+    pdata = result.get("platform_data") or {}
     print(f"\nSaved: {out}")
-    print(f"platform={result.get('platform')} comments={len(result.get('comments') or [])} "
-          f"videos={len(result.get('videos') or [])} images={len(result.get('images') or [])}")
-    if bili:
-        print(f"title={bili.get('title')} total_comments~{bili.get('comment_total')}")
+    print(
+        f"platform={result.get('platform')} comments={len(result.get('comments') or [])} "
+        f"videos={len(result.get('videos') or [])} images={len(result.get('images') or [])}"
+    )
+    if pdata:
+        print(f"title={pdata.get('title')}")
     dl = result.get("downloads") or {}
     if dl:
         print(f"downloads={dl.get('dir')}")
-        for v in dl.get("videos") or []:
-            print(f"  video: {v.get('path')}")
-        for img in dl.get("images") or []:
-            print(f"  image: {img.get('path')}")
     return 0
 
 

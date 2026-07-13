@@ -12,6 +12,8 @@ import urllib.request
 from pathlib import Path
 from typing import Callable
 
+from image_utils import normalize_image_url, strip_bilibili_resize
+
 LogFn = Callable[[str], None]
 
 DOWNLOADS_ROOT = Path(__file__).resolve().parent / "downloads"
@@ -139,16 +141,16 @@ def _entry(base_dir: Path, file_path: Path, url: str, **extra) -> dict:
     }
 
 
-def _download_bilibili_video(
-    bili: dict,
+def _download_platform_video(
+    platform_data: dict,
     vid_dir: Path,
     base_dir: Path,
     title: str,
     referer: str,
     log: LogFn,
 ) -> list[dict]:
-    video_streams = bili.get("video_streams") or []
-    audio_streams = bili.get("audio_streams") or []
+    video_streams = platform_data.get("video_streams") or []
+    audio_streams = platform_data.get("audio_streams") or []
     if not video_streams:
         return []
 
@@ -233,11 +235,11 @@ def download_media(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     referer = _normalize_url(result.get("url", ""))
-    bili = result.get("bilibili") or {}
+    platform_data = result.get("platform_data") or {}
 
     downloaded_images: list[dict] = []
     for i, raw in enumerate(result.get("images") or [], 1):
-        url = _normalize_url(raw)
+        url = strip_bilibili_resize(normalize_image_url(raw))
         if not url.startswith(("http://", "https://")):
             continue
         dest = _download_url(
@@ -250,9 +252,9 @@ def download_media(
         if dest:
             downloaded_images.append(_entry(root, dest, url))
 
-    if bili.get("video_streams"):
-        downloaded_videos = _download_bilibili_video(
-            bili, vid_dir, root, title, referer, log
+    if platform_data.get("video_streams"):
+        downloaded_videos = _download_platform_video(
+            platform_data, vid_dir, root, title, referer, log
         )
     else:
         downloaded_videos = _download_generic_videos(

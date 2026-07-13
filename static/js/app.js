@@ -2,6 +2,8 @@
 
 let currentResult = null;
 let isRunning = false;
+let scrapeStartedAt = 0;
+let pingTimer = null;
 
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => document.querySelectorAll(sel);
@@ -38,26 +40,69 @@ function clamp(value, min, max, fallback) {
   return Math.min(max, Math.max(min, num));
 }
 
+function isVideoPlatformUrl(url) {
+  return /bilibili\.com|b23\.tv|youtube\.com|youtu\.be|vimeo\.com|tiktok\.com|douyin\.com|twitch\.tv|dailymotion\.com|nicovideo\.jp|(?:^|\.)twitter\.com|(?:^|\.)x\.com/i.test(
+    url || ""
+  );
+}
+
+function isBilibiliUrl(url) {
+  return /bilibili\.com|b23\.tv/i.test(url || "");
+}
+
+function applyCommonPresets(url) {
+  if (!url) return;
+  $("#use-saved-profile").checked = true;
+  $("#download-media").checked = true;
+  if ($("#headless-mode").value === "hidden") {
+    $("#headless-mode").value = "auto";
+  }
+}
+
+function applyVideoPresets(url) {
+  applyCommonPresets(url);
+  if (!isVideoPlatformUrl(url)) return;
+  if (clamp(fieldValue("wait-ms", "3500"), 500, 30000, 3500) < 7000) {
+    const waitEl = document.getElementById("wait-ms");
+    if (waitEl) waitEl.value = 8000;
+  }
+  const autoSel = document.getElementById("auto-selector");
+  const autoAi = document.getElementById("auto-selector-ai");
+  if (autoSel) autoSel.checked = false;
+  if (autoAi) autoAi.checked = false;
+}
+
+function fieldChecked(id, fallback = true) {
+  const el = document.getElementById(id);
+  return el ? el.checked : fallback;
+}
+
+function fieldValue(id, fallback = "") {
+  const el = document.getElementById(id);
+  return el ? el.value.trim() : fallback;
+}
+
 function buildRequestBody() {
   return {
     url: urlInput.value.trim(),
-    text_selector: $("#text-sel").value.trim(),
-    comment_selector: $("#comment-sel").value.trim(),
-    cookie: $("#cookie").value.trim(),
-    proxy: $("#proxy").value.trim(),
-    wait_ms: clamp($("#wait-ms").value, 500, 30000, 3500),
-    scroll: $("#scroll").checked,
-    use_chrome: $("#use-chrome").checked,
-    headless: $("#headless-mode").value,
-    max_retries: clamp($("#max-retries").value, 0, 4, 2),
-    simulate_human: $("#simulate-human").checked,
-    block_resources: $("#block-resources").checked,
-    auto_selector: $("#auto-selector").checked,
-    auto_selector_ai: $("#auto-selector-ai").checked,
-    download_media: $("#download-media").checked,
-    ai_api_key: $("#ai-api-key").value.trim(),
-    ai_base_url: $("#ai-base-url").value.trim(),
-    ai_model: $("#ai-model").value.trim(),
+    text_selector: fieldValue("text-sel"),
+    comment_selector: fieldValue("comment-sel"),
+    cookie: fieldValue("cookie"),
+    proxy: fieldValue("proxy"),
+    wait_ms: clamp(fieldValue("wait-ms", "3500"), 500, 30000, 3500),
+    scroll: fieldChecked("scroll", true),
+    use_chrome: fieldChecked("use-chrome", true),
+    headless: fieldValue("headless-mode", "auto") || "auto",
+    max_retries: clamp(fieldValue("max-retries", "2"), 0, 4, 2),
+    simulate_human: fieldChecked("simulate-human", true),
+    block_resources: fieldChecked("block-resources", false),
+    auto_selector: fieldChecked("auto-selector", true),
+    auto_selector_ai: fieldChecked("auto-selector-ai", true),
+    download_media: fieldChecked("download-media", true),
+    use_saved_profile: fieldChecked("use-saved-profile", true),
+    ai_api_key: fieldValue("ai-api-key"),
+    ai_base_url: fieldValue("ai-base-url"),
+    ai_model: fieldValue("ai-model"),
   };
 }
 
@@ -87,10 +132,22 @@ async function startScrape() {
   if (isRunning) return;
 
   isRunning = true;
+  scrapeStartedAt = Date.now();
   setBusy(true);
+  startPingTimer();
   clearResults(false);
   appendLog(`▶  Target: ${url}\n\n`);
+  appendLog("⏳  Starting browser — visible mode may take 30-90s, watch the Log tab …\n");
   switchToTab("log");
+
+  applyCommonPresets(url);
+  applyVideoPresets(url);
+  if (!$("#cookie").value.trim() && !$("#use-saved-profile").checked) {
+    appendLog(
+      "⚠  Tip: enable「Remember login」to stay signed in on any site without copying Cookie\n",
+      "err"
+    );
+  }
 
   const body = buildRequestBody();
 
@@ -130,20 +187,50 @@ async function startScrape() {
     appendLog(`\n❌  ${err.message}\n`, "err");
     setStatus(`❌  ${err.message}`);
   } finally {
+    stopPingTimer();
     isRunning = false;
     setBusy(false);
   }
 }
 
+function startPingTimer() {
+  stopPingTimer();
+  pingTimer = setInterval(() => {
+    if (!isRunning) return;
+    const sec = Math.floor((Date.now() - scrapeStartedAt) / 1000);
+    setStatus(`⏳  Scraping… ${sec}s (browser may be open in background)`);
+  }, 1000);
+}
+
+function stopPingTimer() {
+  if (pingTimer) {
+    clearInterval(pingTimer);
+    pingTimer = null;
+  }
+}
+
 function handleEvent(evt) {
   const { type, data } = evt;
+  if (type === "ping") {
+    const sec = data?.elapsed ?? Math.floor((Date.now() - scrapeStartedAt) / 1000);
+    setStatus(`⏳  Scraping… ${sec}s (browser may be open in background)`);
+    return;
+  }
   if (type === "log") {
     appendLog(`${data}\n`);
     setStatus(data.slice(-80));
   } else if (type === "done") {
     currentResult = data;
     renderResults(data);
-    setStatus("✅  Scrape complete!");
+    const platform = data.platform || "";
+    const ok = platform || !isVideoPlatformUrl(data.url);
+    setStatus(
+      ok && platform
+        ? `✅  Scrape complete! (${platform})`
+        : ok
+          ? "✅  Scrape complete!"
+          : "⚠  Scrape done — video parser may have failed (see Log)"
+    );
     $("#save-txt").disabled = false;
     $("#save-json").disabled = false;
     appendLog(
@@ -156,7 +243,9 @@ function handleEvent(evt) {
         (data.downloads
           ? `   Downloaded : ${data.downloads.images.length} image(s), ${data.downloads.videos.length} video file(s)\n` +
             `   Folder     : ${data.downloads.dir}\n`
-          : ""),
+          : "") +
+        (data.warnings?.length ? `   Warnings   : ${data.warnings.join(" ")}\n` : "") +
+        (data.platform ? `   Platform   : ${data.platform} ✅\n` : ""),
       "ok"
     );
     switchToTab("text");
@@ -172,12 +261,25 @@ function switchToTab(name) {
 }
 
 function renderResults(r) {
+  const warnBanner = (r.warnings || [])
+    .map((w) => `<div class="download-banner warn">${esc(w)}</div>`)
+    .join("");
+  const platformBanner =
+    r.platform
+      ? `<div class="download-banner">Video platform: ${esc(r.platform)} — ${esc(r.title || "")}</div>`
+      : isVideoPlatformUrl(r.url) && !r.platform
+        ? `<div class="download-banner warn">Generic scrape only — video parser failed. Enable Remember login + Visible browser.</div>`
+        : "";
+
   const emptyText = $("#empty-text");
   const textEl = $("#content-text");
 
   if (r.text_paragraphs.length) {
     emptyText.classList.add("hidden");
-    textEl.innerHTML = r.text_paragraphs
+    textEl.innerHTML =
+      warnBanner +
+      platformBanner +
+      r.text_paragraphs
       .map(
         (p, i) =>
           `<div class="content-item"><span class="idx">#${i + 1}</span><div>${esc(p)}</div></div>`
@@ -185,7 +287,7 @@ function renderResults(r) {
       .join("");
   } else {
     emptyText.classList.remove("hidden");
-    textEl.innerHTML = "";
+    textEl.innerHTML = warnBanner + platformBanner;
   }
   $("#count-text").textContent = r.text_paragraphs.length;
 
@@ -240,9 +342,15 @@ function renderResults(r) {
   $("#content-images").innerHTML = displayImages.length
     ? displayImages
         .map((img, i) => {
-          const src = localImageMap[img] || img;
-          return `<div class="image-card" data-url="${escAttr(src)}">
-              <img src="${escAttr(src)}" alt="Image ${i + 1}" loading="lazy" onerror="this.parentElement.style.display='none'" />
+          const norm = normalizeImgUrl(img);
+          const local = localImageMap[norm];
+          const primary = local || norm;
+          return `<div class="image-card" data-url="${escAttr(primary)}">
+              <img src="${escAttr(primary)}" alt="Image ${i + 1}" loading="lazy"
+                referrerpolicy="no-referrer"
+                data-remote="${escAttr(norm)}"
+                data-local="${escAttr(local || "")}"
+                onerror="handleImgError(this)" />
               <span class="img-idx">${i + 1}</span>
             </div>`;
         })
@@ -265,7 +373,7 @@ function renderResults(r) {
     videos: r.videos,
     images: displayImages,
     meta: r.meta,
-    bilibili: r.bilibili,
+    platform_data: r.platform_data,
     downloads: r.downloads,
     discovered_selectors: r.discovered_selectors,
     applied_selectors: r.applied_selectors,
@@ -397,8 +505,35 @@ function appendLog(text, cls) {
 
 function normalizeImgUrl(url) {
   if (!url) return "";
-  if (url.startsWith("//")) return `https:${url}`;
-  return url;
+  let u = url.trim();
+  if (u.startsWith("//")) u = `https:${u}`;
+  if (u.startsWith("http://")) u = `https://${u.slice(7)}`;
+  // Bilibili CDN: strip @resize suffix for stable preview
+  if (u.includes("hdslb.com") && u.includes("@")) {
+    u = u.replace(/@[^/]*$/, "");
+  }
+  return u;
+}
+
+function handleImgError(img) {
+  const remote = img.dataset.remote || "";
+  const local = img.dataset.local || "";
+  const step = img.dataset.errStep || "0";
+  if (step === "0" && local && remote) {
+    img.dataset.errStep = "1";
+    img.src = remote;
+    return;
+  }
+  img.onerror = null;
+  img.classList.add("img-broken");
+  img.alt = "Preview failed";
+  img.parentElement?.classList.add("img-failed");
+}
+
+function imagePreviewSrc(url, localMap) {
+  const norm = normalizeImgUrl(url);
+  if (localMap[norm]) return localMap[norm];
+  return norm;
 }
 
 function esc(text) {
@@ -410,6 +545,33 @@ function esc(text) {
 function escAttr(text) {
   return esc(text).replace(/"/g, "&quot;");
 }
+
+async function loadAppVersion() {
+  try {
+    const resp = await fetch("/api/health");
+    if (!resp.ok) return;
+    const data = await resp.json();
+    const el = $("#app-version");
+    const port = window.location.port || "80";
+    if (el && data.version) {
+      el.textContent = `v${data.version} · :${port}`;
+      el.title = (data.features || []).join(", ");
+    }
+    const badge = document.querySelector(".header-badge");
+    if (badge && data.version) {
+      badge.innerHTML = `<span class="pulse-dot"></span> v${data.version} · :${port}`;
+      if (port !== "8000" && port !== "80" && port !== "") {
+        badge.title = `Non-default port — bookmark http://${window.location.host}`;
+      }
+    }
+  } catch (_) {
+    /* ignore */
+  }
+}
+
+loadAppVersion();
+
+window.handleImgError = handleImgError;
 
 const style = document.createElement("style");
 style.textContent = `@keyframes spin { to { transform: rotate(360deg); } }`;

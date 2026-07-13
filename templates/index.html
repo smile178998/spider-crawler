@@ -72,9 +72,17 @@
             <label for="comment-sel">Comment selector (CSS)</label>
             <input id="comment-sel" type="text" placeholder="Leave empty for heuristic detection" />
           </div>
+          <div class="field field-check field-full">
+            <label class="checkbox-label">
+              <input id="use-saved-profile" type="checkbox" checked />
+              <span class="checkmark"></span>
+              Remember login (all sites — log in once in Visible mode, no manual Cookie)
+            </label>
+            <p class="field-hint">Works for Bilibili, Twitter, forums, etc. Session is stored in <code>.chrome_profile/</code></p>
+          </div>
           <div class="field field-full">
-            <label for="cookie">Cookie (optional)</label>
-            <input id="cookie" type="password" placeholder="key1=value1; key2=value2" autocomplete="off" />
+            <label for="cookie">Cookie (optional — override saved session)</label>
+            <input id="cookie" type="password" placeholder="site_key=value; ... only if needed" autocomplete="off" />
           </div>
           <div class="field field-full">
             <label for="proxy">Proxy (optional)</label>
@@ -249,6 +257,7 @@
 
   <footer class="footer">
     <span id="status-text">Ready</span>
+    <span id="app-version" class="muted"></span>
     <span>For learning and research only · please follow target site's robots.txt and terms of service</span>
   </footer>
 

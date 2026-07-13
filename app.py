@@ -4,6 +4,7 @@
 
 import asyncio
 import json
+import os
 import queue
 import threading
 from pathlib import Path
@@ -28,7 +29,7 @@ except ImportError:
 BASE_DIR = Path(__file__).resolve().parent
 
 DOWNLOADS_ROOT.mkdir(parents=True, exist_ok=True)
-app = FastAPI(title="Modern Web Scraper", version="1.2.0")
+app = FastAPI(title="Modern Web Scraper", version="1.3.0")
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 app.mount("/downloads", StaticFiles(directory=str(DOWNLOADS_ROOT)), name="downloads")
 
@@ -52,6 +53,7 @@ class ScrapeRequest(BaseModel):
     ai_base_url: str = ""
     ai_model: str = ""
     download_media: bool = True
+    use_saved_profile: bool = True
 
     @field_validator("url")
     @classmethod
@@ -88,7 +90,11 @@ async def index():
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "version": "1.3.0",
+        "features": ["video_platforms", "wbi_comments", "download_media", "saved_profile"],
+    }
 
 
 def _normalize_url(url: str) -> str:
@@ -104,11 +110,12 @@ async def scrape(req: ScrapeRequest):
     log_q: queue.Queue = queue.Queue()
 
     def worker():
+        cookie = req.cookie.strip() or os.getenv("BILI_COOKIE", "").strip()
         run_pipeline(
             url,
             req.text_selector.strip(),
             req.comment_selector.strip(),
-            req.cookie.strip(),
+            cookie,
             req.wait_ms,
             req.scroll,
             log_q,
@@ -124,23 +131,42 @@ async def scrape(req: ScrapeRequest):
             ai_base_url=req.ai_base_url.strip(),
             ai_model=req.ai_model.strip(),
             download_media=req.download_media,
+            use_saved_profile=req.use_saved_profile,
         )
 
     thread = threading.Thread(target=worker, daemon=True)
     thread.start()
 
     async def event_stream():
+        import time
+
+        start = time.monotonic()
         while thread.is_alive() or not log_q.empty():
+            emitted = False
             try:
-                kind, payload = log_q.get_nowait()
+                while True:
+                    kind, payload = log_q.get_nowait()
+                    emitted = True
+                    data = json.dumps({"type": kind, "data": payload}, ensure_ascii=False)
+                    yield f"data: {data}\n\n"
+                    if kind in ("done", "error"):
+                        return
             except queue.Empty:
-                await asyncio.sleep(0.1)
+                pass
+
+            if thread.is_alive() and not emitted:
+                elapsed = int(time.monotonic() - start)
+                ping = json.dumps(
+                    {"type": "ping", "data": {"elapsed": elapsed}},
+                    ensure_ascii=False,
+                )
+                yield f"data: {ping}\n\n"
+                await asyncio.sleep(1.0)
                 continue
 
-            data = json.dumps({"type": kind, "data": payload}, ensure_ascii=False)
-            yield f"data: {data}\n\n"
-            if kind in ("done", "error"):
-                return
+            if not thread.is_alive():
+                break
+            await asyncio.sleep(0.05)
 
     return StreamingResponse(
         event_stream(),
@@ -154,6 +180,32 @@ async def scrape(req: ScrapeRequest):
 
 
 if __name__ == "__main__":
+    import socket
+
     import uvicorn
 
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
+    def _pick_port(preferred: int = 8000, span: int = 10) -> int:
+        for port in range(preferred, preferred + span + 1):
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                try:
+                    sock.bind(("0.0.0.0", port))
+                    return port
+                except OSError:
+                    continue
+        raise SystemExit(
+            f"No free port between {preferred} and {preferred + span}. "
+            "Close other python/uvicorn windows or run: "
+            'Get-NetTCPConnection -LocalPort 8000 | % { Stop-Process -Id $_.OwningProcess -Force }'
+        )
+
+    env_port = os.getenv("PORT", "").strip()
+    port = int(env_port) if env_port.isdigit() else _pick_port()
+    if port != 8000:
+        print(f"[Info] Port 8000 is busy — using http://127.0.0.1:{port}")
+        print("[Warn] Close other python app.py windows, or run: .\\scripts\\start.ps1")
+    else:
+        print(f"[Info] Server ready at http://127.0.0.1:{port}")
+    print(f"[Info] Open this URL in your browser ↑  (v1.3.0)")
+
+    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)

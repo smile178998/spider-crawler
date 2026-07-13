@@ -532,6 +532,19 @@ body {
   font-size: 0.8rem;
 }
 
+.download-banner.warn {
+  background: rgba(234, 179, 8, 0.12);
+  border-color: rgba(234, 179, 8, 0.35);
+  color: #fbbf24;
+}
+
+.field-hint {
+  margin: 6px 0 0;
+  font-size: 0.78rem;
+  color: var(--text-muted, #71717a);
+  line-height: 1.4;
+}
+
 /* ── Content list ────────────────────────────────────────────── */
 .content-list { display: flex; flex-direction: column; gap: 10px; }
 
@@ -633,6 +646,25 @@ body {
   height: 100%;
   object-fit: cover;
   display: block;
+}
+
+.image-card img.img-broken {
+  object-fit: contain;
+  opacity: 0.35;
+  padding: 20px;
+}
+
+.image-card.img-failed {
+  cursor: default;
+}
+
+.image-card.img-failed::after {
+  content: "Preview failed";
+  position: absolute;
+  inset: auto 0 12px 0;
+  text-align: center;
+  font-size: 0.72rem;
+  color: var(--dim);
 }
 
 .image-card .img-idx {

@@ -28,7 +28,7 @@
 - 导出结果为 TXT 或 JSON
 
 ### 平台支持：哔哩哔哩 (Bilibili)
-- 自动识别 `bilibili.com` 视频页面
+- 自动识别主流视频平台（Bilibili、YouTube、Vimeo、TikTok、抖音、Twitter/X、Twitch 等）
 - 提取标题、简介、UP 主、播放量/点赞/投币等统计数据
 - 解析 `__INITIAL_STATE__` 和 `__playinfo__` 获取 **DASH 视频/音频流地址**
 - 精选图片：仅保留封面、UP 头像、首帧预览（过滤推荐区缩略图）
@@ -61,7 +61,10 @@ spaider_crawler/
 ├── app.py              # FastAPI Web 服务 + SSE API
 ├── scraper_core.py     # Playwright 管道 + 内容解析
 ├── selector_engine.py  # 智能 CSS 选择器发现（启发式 + AI）
-├── bilibili_parser.py  # B 站视频元数据与流媒体提取
+├── video_platforms/    # 多平台视频元数据与流媒体提取
+│   ├── bilibili.py     # B 站处理器（WBI 评论、DASH 流）
+│   ├── generic.py      # YouTube、Vimeo、TikTok 等（meta/JSON-LD）
+│   └── merge.py        # 统一结果合并
 ├── image_utils.py      # 图片 URL 规范化与垃圾过滤
 ├── requirements.txt
 ├── payload.json        # API 请求示例
@@ -207,7 +210,7 @@ HTML → DOM 评分 → 生成 CSS 选择器 → 验证 → 重新提取
 
 发现的选择器显示在 **Selectors** 选项卡，API 响应中位于 `discovered_selectors` / `applied_selectors` 字段。
 
-> **说明：** B 站链接会跳过通用自动选择器，改用 `bilibili_parser.py` 专用解析。
+> **说明：** 已知视频平台链接会跳过通用自动选择器，改用 `video_platforms/` 模块解析。
 
 ---
 
@@ -343,7 +346,7 @@ Invoke-WebRequest `
     "bilibili_aid": "116686023891513",
     "bilibili_cid": "38829687897"
   },
-  "bilibili": {
+  "platform_data": {
     "bvid": "BV1yk7X6KEz4",
     "aid": 116686023891513,
     "cid": 38829687897,

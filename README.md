@@ -28,7 +28,7 @@ A Playwright-powered web scraper with a FastAPI web UI. It launches a real Chrom
 - Export results to TXT or JSON
 
 ### Platform support: Bilibili
-- Auto-detects `bilibili.com` video pages
+- Auto-detects major video platforms (Bilibili, YouTube, Vimeo, TikTok, Douyin, Twitter/X, Twitch, and more)
 - Extracts title, description, UP owner, stats (views, likes, coins, etc.)
 - Parses `__INITIAL_STATE__` and `__playinfo__` for **DASH video/audio stream URLs**
 - Curated images only: cover, UP avatar, first-frame preview (no recommendation clutter)
@@ -61,7 +61,10 @@ spaider_crawler/
 ├── app.py              # FastAPI web server + SSE API
 ├── scraper_core.py     # Playwright pipeline + content parsing
 ├── selector_engine.py  # Smart CSS selector discovery (heuristic + AI)
-├── bilibili_parser.py  # Bilibili video metadata + stream extraction
+├── video_platforms/    # Multi-platform video metadata + stream extraction
+│   ├── bilibili.py     # Bilibili handler (WBI comments, DASH streams)
+│   ├── generic.py      # YouTube, Vimeo, TikTok, etc. via meta/JSON-LD
+│   └── merge.py        # Unified result merge
 ├── image_utils.py      # Image URL normalization and junk filtering
 ├── requirements.txt
 ├── payload.json        # Example API request body
@@ -207,7 +210,7 @@ HTML → DOM scoring → CSS selector generation → validate → re-extract
 
 Discovered selectors appear in the **Selectors** tab and in the API response under `discovered_selectors` / `applied_selectors`.
 
-> **Note:** Bilibili URLs bypass the generic auto-selector and use `bilibili_parser.py` instead.
+> **Note:** Known video platform URLs bypass the generic auto-selector and use `video_platforms/` instead.
 
 ---
 
@@ -343,7 +346,7 @@ After a successful scrape, the `done` event contains:
     "bilibili_aid": "116686023891513",
     "bilibili_cid": "38829687897"
   },
-  "bilibili": {
+  "platform_data": {
     "bvid": "BV1yk7X6KEz4",
     "aid": 116686023891513,
     "cid": 38829687897,

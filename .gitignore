@@ -3,5 +3,6 @@ __pycache__/
 .venv/
 .env
 .demo_frames/
-.output_bilibili.json
+output_*.json
 downloads/
+.chrome_profile/

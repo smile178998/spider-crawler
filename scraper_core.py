@@ -4,18 +4,25 @@
 
 from __future__ import annotations
 
+import os
 import queue
 import random
 import re
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable
 from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
 from playwright.sync_api import Browser, BrowserContext, Page, Playwright, sync_playwright
-from bilibili_parser import extract_bilibili, is_bilibili_url, merge_bilibili_result
-from image_utils import collect_images
+from video_platforms import (
+    detect_video_platform,
+    extract_platform_data,
+    is_video_platform_url,
+    merge_platform_result,
+)
+from image_utils import collect_images, filter_images_for_url, pick_og_image, strip_bilibili_resize
 from media_downloader import download_media
 from selector_engine import SelectorConfig, enhance_with_auto_selectors
 
@@ -28,6 +35,8 @@ except ImportError:
     HAS_STEALTH = False
 
 LogFn = Callable[[str], None]
+
+PROFILE_DIR = Path(__file__).resolve().parent / ".chrome_profile"
 
 COMMENT_HINTS = [
     "comment", "comments", "reply", "replies", "discuss",
@@ -124,6 +133,8 @@ CHALLENGE_TITLE_HINTS = [
     "robot check",
     "access denied",
     "ddos protection",
+    "验证码",
+    "captcha",
 ]
 
 CHALLENGE_HTML_HINTS = [
@@ -136,6 +147,9 @@ CHALLENGE_HTML_HINTS = [
     "hcaptcha.com",
     "captcha-container",
     "turnstile-wrapper",
+    "geetest",
+    "bilibili-captcha",
+    "verifycenter",
 ]
 
 
@@ -151,6 +165,7 @@ class FetchConfig:
     max_retries: int = 2
     simulate_human: bool = True
     block_resources: bool = False
+    use_saved_profile: bool = True
 
 
 def _stealth_init_script(languages: list[str], navigator_platform: str) -> str:
@@ -274,14 +289,26 @@ def _is_challenge_page(html: str, title: str) -> bool:
     return any(hint in html_lower for hint in CHALLENGE_HTML_HINTS)
 
 
-def _content_quality(html: str, inner_text: str) -> int:
+def _content_quality(html: str, inner_text: str, data: dict | None = None, url: str = "") -> int:
     if _is_challenge_page(html, ""):
         return 0
+    if is_video_platform_url(url) and data and data.get("platform_data"):
+        return 10_000
     text_len = len(inner_text.strip())
     score = min(text_len, 5000)
     if text_len < 80:
         score -= 500
+    if is_video_platform_url(url) and not (data and data.get("platform_data")):
+        score = min(score, 400)
     return score
+
+
+def _fetch_success(data: dict, url: str) -> bool:
+    if _is_challenge_page(data.get("html", ""), data.get("title", "")):
+        return False
+    if is_video_platform_url(url):
+        return bool(data.get("platform_data"))
+    return _content_quality(data.get("html", ""), data.get("inner_text", "")) >= 800
 
 
 def _build_strategies(cfg: FetchConfig) -> list[tuple[bool, int]]:
@@ -454,15 +481,66 @@ def _extract_page_data(page: Page, url: str, log: LogFn | None = None) -> dict:
         "video_urls_from_dom": video_urls,
     }
 
-    if is_bilibili_url(url):
+    platform = detect_video_platform(url)
+    if platform:
         log_fn = log or (lambda _msg: None)
-        log_fn("[Bilibili] Detected video page — extracting metadata and streams ...")
-        bili = extract_bilibili(page, log_fn)
-        if bili:
-            data["bilibili_data"] = bili
-            if bili.get("title"):
-                data["title"] = bili["title"]
+        payload = extract_platform_data(page, url, log_fn)
+        if payload:
+            data["platform_data"] = payload
+            if payload.get("title"):
+                data["title"] = payload["title"]
 
+    return data
+
+
+def _fetch_on_page(
+    page: Page,
+    cfg: FetchConfig,
+    profile: dict,
+    wait_ms: int,
+    log: LogFn,
+) -> dict:
+    if HAS_STEALTH:
+        _stealth.apply_stealth_sync(page)
+    if cfg.block_resources:
+        _setup_resource_blocking(page)
+        log("[Browser] Blocking images/fonts/styles for faster load.")
+
+    log(f"[Browser] Navigating to {cfg.url} ...")
+    page.goto(cfg.url, wait_until="domcontentloaded", timeout=60_000)
+
+    try:
+        page.wait_for_load_state("networkidle", timeout=15_000)
+    except Exception:
+        pass
+
+    if cfg.simulate_human:
+        _simulate_human(page, profile["viewport"])
+
+    if _is_challenge_page(page.content(), page.title()):
+        if cfg.use_saved_profile:
+            log("[Browser] Verification detected — complete it in the browser window if visible.")
+        _wait_for_challenge(page, log, timeout_ms=45_000)
+        try:
+            page.wait_for_load_state("networkidle", timeout=10_000)
+        except Exception:
+            pass
+
+    if cfg.scroll:
+        log("[Browser] Scrolling page to trigger lazy-loaded content ...")
+        _human_scroll(page)
+
+    jittered_wait = max(500, int(wait_ms * random.uniform(0.9, 1.2)))
+    log(f"[Browser] Waiting ~{jittered_wait} ms for JavaScript to settle ...")
+    page.wait_for_timeout(jittered_wait)
+
+    data = _extract_page_data(page, cfg.url, log)
+    if is_video_platform_url(cfg.url) and not data.get("platform_data"):
+        platform = detect_video_platform(cfg.url) or "video"
+        log(f"[Video:{platform}] Parser missed data — waiting extra 4s and retrying ...")
+        page.wait_for_timeout(4000)
+        data = _extract_page_data(page, cfg.url, log)
+    log(f"[Browser] Done. Title: {data['title']!r}")
     return data
 
 
@@ -474,47 +552,74 @@ def _attempt_fetch(
     wait_ms: int,
     log: LogFn,
 ) -> dict:
+    if cfg.use_saved_profile:
+        ctx: BrowserContext | None = None
+        try:
+            PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+            viewport = profile["viewport"]
+            launch_kwargs: dict = {
+                "headless": headless,
+                "viewport": viewport,
+                "locale": profile["locale"],
+                "timezone_id": profile["timezone"],
+                "args": BROWSER_ARGS,
+                "ignore_https_errors": True,
+            }
+            proxy = _parse_proxy(cfg.proxy)
+            if proxy:
+                launch_kwargs["proxy"] = proxy
+                log(f"[Browser] Using proxy: {proxy['server']}")
+            if cfg.use_chrome:
+                launch_kwargs["channel"] = "chrome"
+            log("[Browser] Using saved login profile — sessions persist for all sites.")
+            if not headless:
+                log("[Browser] Opening visible Chrome window — may take 30-60s on first run …")
+            try:
+                ctx = pw.chromium.launch_persistent_context(
+                    str(PROFILE_DIR), **launch_kwargs
+                )
+            except Exception as exc:
+                err = str(exc)
+                if "ProcessSingleton" in err or "already in use" in err.lower():
+                    log(
+                        "[Browser] Profile locked — close other Chrome/scraper windows, "
+                        "then retry. Falling back to temporary browser."
+                    )
+                else:
+                    log(f"[Browser] Profile launch failed ({exc}) — using temporary browser.")
+                fallback = FetchConfig(
+                    url=cfg.url,
+                    wait_ms=cfg.wait_ms,
+                    cookie=cfg.cookie,
+                    scroll=cfg.scroll,
+                    proxy=cfg.proxy,
+                    use_chrome=cfg.use_chrome,
+                    headless=cfg.headless,
+                    max_retries=cfg.max_retries,
+                    simulate_human=cfg.simulate_human,
+                    block_resources=cfg.block_resources,
+                    use_saved_profile=False,
+                )
+                return _attempt_fetch(pw, fallback, profile, headless, wait_ms, log)
+
+            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            if cfg.cookie.strip():
+                cookies = _parse_cookies(cfg.cookie, cfg.url)
+                if cookies:
+                    ctx.add_cookies(cookies)
+                    log(f"[Browser] Also injected {len(cookies)} extra cookie(s).")
+
+            return _fetch_on_page(page, cfg, profile, wait_ms, log)
+        finally:
+            if ctx is not None:
+                ctx.close()
+
     browser: Browser | None = None
     try:
         browser = _launch_browser(pw, cfg, headless, log)
         ctx = _create_context(browser, profile, cfg.url, cfg.cookie, log)
         page = ctx.new_page()
-
-        if HAS_STEALTH:
-            _stealth.apply_stealth_sync(page)
-        if cfg.block_resources:
-            _setup_resource_blocking(page)
-            log("[Browser] Blocking images/fonts/styles for faster load.")
-
-        log(f"[Browser] Navigating to {cfg.url} ...")
-        page.goto(cfg.url, wait_until="domcontentloaded", timeout=60_000)
-
-        try:
-            page.wait_for_load_state("networkidle", timeout=15_000)
-        except Exception:
-            pass
-
-        if cfg.simulate_human:
-            _simulate_human(page, profile["viewport"])
-
-        if _is_challenge_page(page.content(), page.title()):
-            _wait_for_challenge(page, log, timeout_ms=45_000)
-            try:
-                page.wait_for_load_state("networkidle", timeout=10_000)
-            except Exception:
-                pass
-
-        if cfg.scroll:
-            log("[Browser] Scrolling page to trigger lazy-loaded content ...")
-            _human_scroll(page)
-
-        jittered_wait = max(500, int(wait_ms * random.uniform(0.9, 1.2)))
-        log(f"[Browser] Waiting ~{jittered_wait} ms for JavaScript to settle ...")
-        page.wait_for_timeout(jittered_wait)
-
-        data = _extract_page_data(page, cfg.url, log)
-        log(f"[Browser] Done. Title: {data['title']!r}")
-        return data
+        return _fetch_on_page(page, cfg, profile, wait_ms, log)
     finally:
         if browser is not None:
             browser.close()
@@ -542,6 +647,7 @@ def browser_fetch(
         max_retries=int(kwargs.get("max_retries", 2)),
         simulate_human=bool(kwargs.get("simulate_human", True)),
         block_resources=bool(kwargs.get("block_resources", False)),
+        use_saved_profile=bool(kwargs.get("use_saved_profile", True)),
     )
 
     if HAS_STEALTH:
@@ -566,14 +672,14 @@ def browser_fetch(
 
             try:
                 data = _attempt_fetch(pw, cfg, profile, headless, attempt_wait, log)
-                score = _content_quality(data["html"], data["inner_text"])
+                score = _content_quality(data["html"], data["inner_text"], data, cfg.url)
                 log(f"[Browser] Content quality score: {score}")
 
                 if score > best_score:
                     best = data
                     best_score = score
 
-                if score >= 800 and not _is_challenge_page(data["html"], data["title"]):
+                if _fetch_success(data, cfg.url):
                     log("[Browser] Good content captured — stopping retries.")
                     break
 
@@ -592,6 +698,12 @@ def browser_fetch(
 
     if _is_challenge_page(best["html"], best["title"]):
         log("[Warn] Page may still be behind bot protection — content could be incomplete.")
+    elif is_video_platform_url(cfg.url) and not best.get("platform_data"):
+        platform = detect_video_platform(cfg.url) or "video"
+        log(
+            f"[Warn] {platform} parser did not extract video data. "
+            "Use saved login / Cookie, Visible browser, and increase JS wait."
+        )
 
     return best
 
@@ -631,19 +743,25 @@ def parse_content(data: dict, text_sel: str, comment_sel: str) -> dict:
             videos.append(urljoin(base, anchor["href"]))
     videos = _dedup(videos)
 
-    images = []
-    for img in soup.find_all("img"):
-        src = _image_src(img, base)
-        if src:
-            images.append(src)
-    images = collect_images(images)
-
-    meta = {}
+    meta: dict[str, str] = {}
     for tag in soup.find_all("meta"):
         name = tag.get("name") or tag.get("property") or ""
         content = tag.get("content", "")
         if name and content:
             meta[name] = content
+
+    images = []
+    for img in soup.find_all("img"):
+        src = _image_src(img, base)
+        if src:
+            images.append(src)
+    plat = "bilibili" if detect_video_platform(base) == "bilibili" else ""
+    images = collect_images(images, platform=plat)
+    if plat:
+        og = pick_og_image(meta, platform=plat)
+        images = filter_images_for_url(base, images, limit=5)
+        if og:
+            images = collect_images([og] + images, limit=5, platform=plat)
 
     return {
         "url": base,
@@ -749,12 +867,44 @@ def run_pipeline(
         log_q.put(("log", msg))
 
     try:
+        if kwargs.get("use_saved_profile", True):
+            log("[Browser] Saved profile ON — sign in once per site (Visible mode); Cookie optional.")
+
+        video_mode = is_video_platform_url(url)
+        if video_mode:
+            platform = detect_video_platform(url) or "video"
+            if platform == "bilibili":
+                cookie = (cookie or "").strip() or os.getenv("BILI_COOKIE", "").strip()
+            wait_ms = max(int(wait_ms), 8000)
+            kwargs["auto_selector"] = False
+            kwargs["auto_selector_ai"] = False
+            log(f"[Video:{platform}] Using platform parser (auto-selector disabled, wait ≥ 8s).")
+            if cookie:
+                log("[Video] Login cookie detected.")
+            elif kwargs.get("use_saved_profile", True):
+                log("[Video] Using saved Chrome profile — works for all video sites.")
+            else:
+                log("[Video] Tip: enable saved profile or paste Cookie for login & comments.")
+
         raw = browser_fetch(url, wait_ms, cookie, scroll, log_q, **kwargs)
         result = parse_content(raw, text_sel, comment_sel)
+        warnings: list[str] = []
 
-        if raw.get("bilibili_data"):
-            log("[Bilibili] Merging platform-specific data into results ...")
-            result = merge_bilibili_result(result, raw["bilibili_data"])
+        if raw.get("platform_data"):
+            platform = raw["platform_data"].get("platform") or detect_video_platform(url) or "video"
+            log(f"[Video:{platform}] Merging platform-specific data into results ...")
+            result = merge_platform_result(result, raw["platform_data"])
+        elif video_mode:
+            warnings.append(
+                f"{detect_video_platform(url) or 'Video'} parser failed — page may be a captcha "
+                "or missing login. Try: Remember login + Visible browser + JS wait 8000ms."
+            )
+            log("[Warn] " + warnings[-1])
+            result["images"] = filter_images_for_url(result["url"], result.get("images") or [])
+            result["videos"] = [
+                v for v in (result.get("videos") or [])
+                if v and not str(v).startswith("blob:")
+            ]
         else:
             selector_cfg = SelectorConfig(
                 enabled=bool(kwargs.get("auto_selector", True)),
@@ -770,6 +920,9 @@ def run_pipeline(
         if kwargs.get("download_media", True):
             log("[Download] Saving images and videos to disk ...")
             result = download_media(result, log)
+
+        if warnings:
+            result["warnings"] = warnings
 
         log_q.put(("done", result))
     except Exception as exc:
