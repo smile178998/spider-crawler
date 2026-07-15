@@ -66,6 +66,7 @@ A Playwright-powered web scraper with a FastAPI web UI. It launches a real Chrom
 - Multi-strategy retry: headless → extended wait → visible browser fallback
 - Navigation retry on transient network errors; dead env proxies auto-skipped
 - HTTP/SOCKS5 **proxy** support (UI field or `SCRAPER_PROXY` / `HTTP_PROXY` env vars)
+- **ProxyRotator** — round-robin / random / custom strategies for all Session types; per-request `proxy=` override
 - Configurable JS wait time and auto-scroll
 - **Port auto-selection** — if 8000 is busy, tries 8001+ automatically
 
@@ -84,6 +85,7 @@ spaider_crawler/
 ├── stealthy_fetcher.py # StealthyFetcher — fingerprint spoofing + Cloudflare solver
 ├── session_store.py    # Cookie / state persistence helpers
 ├── sessions.py         # Unified exports: FetcherSession / DynamicSession / StealthySession
+├── proxy_rotator.py    # ProxyRotator — round-robin / random / custom strategies
 ├── video_platforms/    # Multi-platform video metadata + stream extraction
 │   ├── __init__.py     # detect / extract / merge entry points
 │   ├── registry.py     # Platform URL matching and dispatch
@@ -415,6 +417,43 @@ with DynamicSession(real_chrome=True) as s:
 ```
 
 Or import sessions from their modules: `from fetcher import FetcherSession`, etc.
+
+---
+
+## Proxy rotation
+
+Built-in ``ProxyRotator`` works with **all Session types**. Default strategy is round-robin; pass a custom callable for your own policy. Per-request ``proxy=`` always overrides the rotator.
+
+```python
+from sessions import FetcherSession, DynamicSession, ProxyRotator, random_rotation
+
+rotator = ProxyRotator([
+    "http://1.2.3.4:8080",
+    {"server": "http://5.6.7.8:8080", "username": "u", "password": "p"},
+])
+
+with FetcherSession(proxy_rotator=rotator) as s:
+    s.get("https://example.com/a")   # proxy #1
+    s.get("https://example.com/b")   # proxy #2
+    s.get("https://example.com/c")   # proxy #1 again
+    # Force a specific proxy for one call:
+    s.get("https://example.com/d", proxy="http://9.9.9.9:3128")
+    # Direct (no proxy) for one call:
+    s.get("https://example.com/e", proxy=None)
+    print(s.last_proxy)
+
+# Random strategy
+rotator = ProxyRotator(proxies, strategy=random_rotation)
+
+# Custom sticky strategy
+def sticky(proxies, idx):
+    return proxies[0], idx
+
+with DynamicSession(proxy_rotator=ProxyRotator(proxies, strategy=sticky)) as s:
+    s.fetch("https://example.com")
+```
+
+Failed proxies can be skipped: ``rotator.mark_failed(proxy)`` / ``rotator.reset_failures()``.
 
 ---
 

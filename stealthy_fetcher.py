@@ -466,6 +466,7 @@ class StealthySession:
     def __init__(self, **kwargs: Any) -> None:
         session_file = kwargs.pop("session_file", None)
         state = kwargs.pop("state", None)
+        proxy_rotator = kwargs.pop("proxy_rotator", None)
         real_chrome = _as_bool_chrome(kwargs)
         solve_cf = bool(kwargs.pop("solve_cloudflare", True))
         humanize = bool(kwargs.pop("humanize", solve_cf or True))
@@ -527,6 +528,14 @@ class StealthySession:
         self._log: Callable[[str], None] = lambda _m: None
         self.state: dict[str, Any] = dict(state or {})
         self._session_file = Path(session_file) if session_file else None
+        self._proxy_rotator = proxy_rotator
+        self.last_proxy: Optional[str] = None
+
+        if self._proxy_rotator is not None and self.opts.proxy:
+            raise ValueError(
+                "Cannot use proxy_rotator together with a static proxy. "
+                "Pass one or the other (per-request proxy= still overrides)."
+            )
 
         if self._session_file and self._session_file.is_file():
             from session_store import load_session_file
@@ -628,7 +637,10 @@ class StealthySession:
             profile["timezone"] = opts.timezone_id
 
         args = self._stealth_args()
-        proxy = _normalize_proxy(opts.proxy)
+        # Static proxy at launch only when not rotating
+        proxy = None
+        if self._proxy_rotator is None:
+            proxy = _normalize_proxy(opts.proxy)
         launch_kwargs: dict[str, Any] = {
             "headless": opts.headless,
             "args": args,
@@ -689,19 +701,20 @@ class StealthySession:
                 errors.append(f"ephemeral/{channel or 'chromium'}: {exc}")
                 return None
 
-        # Prefer persistent context (more realistic cookies / storage)
+        # Prefer persistent context unless rotating (need Browser.new_context per proxy).
         order: list[Optional[str]] = []
         if opts.real_chrome:
             order.extend(["chrome", None])
         else:
             order.extend([None, "chrome"])
 
-        for channel in order:
-            got = try_persistent(channel)
-            if got:
-                ctx, label = got
-                self._apply_init_scripts(ctx, profile, url_hint="https://example.com")
-                return None, ctx, label
+        if self._proxy_rotator is None:
+            for channel in order:
+                got = try_persistent(channel)
+                if got:
+                    ctx, label = got
+                    self._apply_init_scripts(ctx, profile, url_hint="https://example.com")
+                    return None, ctx, label
 
         for channel in order:
             got_e = try_ephemeral(channel)
@@ -754,6 +767,13 @@ class StealthySession:
             raise FetchError("URL is required")
         url = str(url).strip()
 
+        from proxy_rotator import (
+            is_proxy_error,
+            normalize_proxy,
+            proxy_to_url,
+            resolve_request_proxy,
+        )
+
         owns = False
         if not self._entered:
             self.__enter__()
@@ -761,7 +781,6 @@ class StealthySession:
 
         assert self._context is not None
         opts = self.opts
-        # lightweight per-call overrides
         solve_cf = bool(overrides.pop("solve_cloudflare", opts.solve_cloudflare))
         wait = int(overrides.pop("wait", opts.wait))
         network_idle = bool(overrides.pop("network_idle", opts.network_idle))
@@ -770,8 +789,57 @@ class StealthySession:
         page_setup = overrides.pop("page_setup", opts.page_setup)
         extra_headers = overrides.pop("extra_headers", None)
 
+        if "proxy" in overrides:
+            chosen_proxy = overrides.pop("proxy")
+        else:
+            chosen_proxy = resolve_request_proxy(
+                request_proxy=None,
+                proxy_rotator=self._proxy_rotator,
+                session_proxy=opts.proxy if self._proxy_rotator is None else None,
+            )
+        fetch_proxy = (
+            normalize_proxy(chosen_proxy) if chosen_proxy not in (None, "") else None
+        )
+        self.last_proxy = proxy_to_url(fetch_proxy) if fetch_proxy else None
+
+        ephemeral = False
+        ctx = self._context
+        if fetch_proxy is not None and self._browser is not None:
+            profile = _pick_profile(opts.useragent, opts.locale, opts.viewport)
+            if opts.timezone_id:
+                profile["timezone"] = opts.timezone_id
+            headers = _build_headers(
+                profile["ua"], url, profile["languages"], profile["platform"]
+            )
+            if opts.google_search:
+                headers["Referer"] = "https://www.google.com/"
+            if opts.extra_headers:
+                headers.update({str(k): str(v) for k, v in opts.extra_headers.items()})
+            if extra_headers:
+                headers.update({str(k): str(v) for k, v in dict(extra_headers).items()})
+            ctx = self._browser.new_context(
+                user_agent=profile["ua"],
+                viewport={
+                    "width": int(profile["viewport"]["width"]),
+                    "height": int(profile["viewport"]["height"]),
+                },
+                locale=profile["locale"],
+                timezone_id=profile["timezone"],
+                ignore_https_errors=True,
+                extra_http_headers=headers,
+                proxy=fetch_proxy,
+            )
+            self._apply_init_scripts(ctx, profile, url_hint=url)
+            existing = self.get_cookies()
+            if existing:
+                try:
+                    ctx.add_cookies(existing)
+                except Exception:
+                    pass
+            ephemeral = True
+
         started = time.perf_counter()
-        page = self._context.new_page()
+        page = ctx.new_page()
         page.set_default_timeout(opts.timeout)
 
         try:
@@ -784,12 +852,10 @@ class StealthySession:
             if opts.disable_resources:
                 _block_heavy_resources(page)
 
-            if extra_headers:
+            if extra_headers and not ephemeral:
                 page.set_extra_http_headers(
                     {str(k): str(v) for k, v in dict(extra_headers).items()}
                 )
-
-            # Seed cookies only once; thereafter context holds them
 
             if page_setup:
                 page_setup(page)
@@ -838,6 +904,12 @@ class StealthySession:
                 except Exception:
                     pass
 
+            if ephemeral:
+                try:
+                    self.set_cookies(ctx.cookies())
+                except Exception:
+                    pass
+
             still_challenged = _page_has_cf_challenge(page)
             elapsed = time.perf_counter() - started
             return DynamicFetchResult(
@@ -862,15 +934,26 @@ class StealthySession:
                     "hide_canvas": opts.hide_canvas,
                     "block_webrtc": opts.block_webrtc,
                     "allow_webgl": opts.allow_webgl,
+                    "proxy": self.last_proxy,
                 },
             )
         except Exception as exc:
+            if self._proxy_rotator is not None and fetch_proxy and is_proxy_error(exc):
+                try:
+                    self._proxy_rotator.mark_failed(fetch_proxy)
+                except Exception:
+                    pass
             raise FetchError(f"StealthyFetcher failed for {url}: {exc}") from exc
         finally:
             try:
                 page.close()
             except Exception:
                 pass
+            if ephemeral and ctx is not self._context:
+                try:
+                    ctx.close()
+                except Exception:
+                    pass
             if owns:
                 self.close()
 
@@ -881,6 +964,10 @@ class StealthySession:
             return [dict(c) for c in self._context.cookies()]
         except Exception:
             return []
+
+    @property
+    def proxy_rotator(self) -> Any:
+        return self._proxy_rotator
 
     def cookies_map(self) -> dict[str, str]:
         from session_store import cookies_to_dict

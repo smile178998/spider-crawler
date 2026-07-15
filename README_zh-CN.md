@@ -66,6 +66,7 @@
 - 多策略重试：无头 → 延长等待 → 有界面浏览器回退
 - 网络错误自动重试导航；失效的环境变量代理自动跳过
 - HTTP/SOCKS5 **代理** 支持（界面填写或 `SCRAPER_PROXY` / `HTTP_PROXY` 环境变量）
+- **ProxyRotator** — 所有 Session 支持轮询 / 随机 / 自定义策略；单次请求可用 `proxy=` 覆盖
 - 可配置 JS 等待时间与自动滚动
 - **端口自动选择** — 8000 被占用时自动尝试 8001+
 
@@ -84,6 +85,7 @@ spaider_crawler/
 ├── stealthy_fetcher.py # StealthyFetcher — 指纹伪装 + Cloudflare 挑战处理
 ├── session_store.py    # Cookie / 状态持久化工具
 ├── sessions.py         # 统一导出：FetcherSession / DynamicSession / StealthySession
+├── proxy_rotator.py    # ProxyRotator — 轮询 / 随机 / 自定义策略
 ├── video_platforms/    # 多平台视频元数据与流媒体提取
 │   ├── __init__.py     # 检测 / 提取 / 合并入口
 │   ├── registry.py     # 平台 URL 匹配与调度
@@ -415,6 +417,43 @@ with DynamicSession(real_chrome=True) as s:
 ```
 
 也可从各模块直接导入：`from fetcher import FetcherSession` 等。
+
+---
+
+## Proxy 轮换
+
+内置 ``ProxyRotator``，适用于**所有 Session 类型**。默认轮询；可传入自定义策略函数。单次请求的 ``proxy=`` 始终覆盖旋转器。
+
+```python
+from sessions import FetcherSession, DynamicSession, ProxyRotator, random_rotation
+
+rotator = ProxyRotator([
+    "http://1.2.3.4:8080",
+    {"server": "http://5.6.7.8:8080", "username": "u", "password": "p"},
+])
+
+with FetcherSession(proxy_rotator=rotator) as s:
+    s.get("https://example.com/a")   # 代理 #1
+    s.get("https://example.com/b")   # 代理 #2
+    s.get("https://example.com/c")   # 再次 #1
+    # 单次强制指定代理：
+    s.get("https://example.com/d", proxy="http://9.9.9.9:3128")
+    # 单次直连（不用代理）：
+    s.get("https://example.com/e", proxy=None)
+    print(s.last_proxy)
+
+# 随机策略
+rotator = ProxyRotator(proxies, strategy=random_rotation)
+
+# 自定义：始终用第一个
+def sticky(proxies, idx):
+    return proxies[0], idx
+
+with DynamicSession(proxy_rotator=ProxyRotator(proxies, strategy=sticky)) as s:
+    s.fetch("https://example.com")
+```
+
+失败代理可跳过：``rotator.mark_failed(proxy)`` / ``rotator.reset_failures()``。
 
 ---
 

@@ -257,6 +257,7 @@ class _FetcherCore:
         follow_redirects: bool = True,
         verify: bool = True,
         default_headers: bool = True,
+        proxy_rotator: Any = None,
     ) -> None:
         self.impersonate = impersonate
         self.stealthy_headers = stealthy_headers
@@ -269,7 +270,9 @@ class _FetcherCore:
         self.follow_redirects = follow_redirects
         self.verify = verify
         self.default_headers = default_headers
+        self.proxy_rotator = proxy_rotator
         self._session: Any = None
+        self.last_proxy: Optional[str] = None
 
     def attach_session(self, session: Any) -> None:
         self._session = session
@@ -296,7 +299,7 @@ class _FetcherCore:
         stealthy_headers: Optional[bool] = None,
         http3: Optional[bool] = None,
         timeout: Optional[float] = None,
-        proxy: Optional[str] = None,
+        proxy: Any = ...,  # type: ignore[assignment]
         proxies: Optional[Mapping[str, str]] = None,
         allow_redirects: Optional[bool] = None,
         verify: Optional[bool] = None,
@@ -310,10 +313,40 @@ class _FetcherCore:
         stealth = self.stealthy_headers if stealthy_headers is None else stealthy_headers
         use_http3 = self.http3 if http3 is None else http3
         timeout_val = self.timeout if timeout is None else timeout
-        proxy_val = _normalize_proxy(proxy if proxy is not None else self.proxy)
-        proxies_val = dict(proxies) if proxies is not None else dict(self.proxies)
-        if proxy_val and not proxies_val:
-            proxies_val = {"http": proxy_val, "https": proxy_val}
+
+        from proxy_rotator import (
+            is_proxy_error,
+            proxy_to_curl_map,
+            proxy_to_url,
+            resolve_request_proxy,
+        )
+
+        # Per-request proxy (including explicit None to force direct) > rotator > session
+        if proxy is not ...:
+            chosen: Any = proxy
+            use_rotator = False
+        else:
+            chosen = resolve_request_proxy(
+                request_proxy=None,
+                proxy_rotator=self.proxy_rotator if proxies is None else None,
+                session_proxy=self.proxy,
+            )
+            use_rotator = self.proxy_rotator is not None and proxies is None
+
+        if proxies is not None:
+            proxies_val = dict(proxies)
+            proxy_val = proxies_val.get("https") or proxies_val.get("http")
+        elif chosen is not None and chosen != "":
+            proxies_val = proxy_to_curl_map(chosen) or {}
+            proxy_val = proxy_to_url(chosen)
+        elif self.proxies and proxy is ...:
+            proxies_val = dict(self.proxies)
+            proxy_val = proxies_val.get("https") or proxies_val.get("http")
+        else:
+            proxies_val = {}
+            proxy_val = None
+
+        self.last_proxy = proxy_val
         redirects = self.follow_redirects if allow_redirects is None else allow_redirects
         verify_val = self.verify if verify is None else verify
 
@@ -346,7 +379,6 @@ class _FetcherCore:
                         allow_redirects=bool(redirects),
                         verify=bool(verify_val),
                     )
-                # urllib fallback — no TLS impersonation / HTTP/3
                 body: Optional[bytes] = None
                 if json_body is not None:
                     body = json.dumps(json_body).encode("utf-8")
@@ -375,7 +407,15 @@ class _FetcherCore:
                 )
             except Exception as exc:
                 last_err = exc
-                # HTTP/3 + impersonate can fail on some networks — retry without HTTP/3
+                if use_rotator and chosen is not None and is_proxy_error(exc):
+                    try:
+                        self.proxy_rotator.mark_failed(chosen)
+                    except Exception:
+                        pass
+                    chosen = self.proxy_rotator.get_proxy()
+                    proxies_val = proxy_to_curl_map(chosen) or {}
+                    proxy_val = proxy_to_url(chosen)
+                    self.last_proxy = proxy_val
                 if use_http3 and HAS_CURL_CFFI and attempt + 1 < attempts:
                     use_http3 = False
                     continue
@@ -544,6 +584,7 @@ class FetcherSession:
         cookies: Any = None,
         session_file: Optional[Union[str, Path]] = None,
         state: Optional[Mapping[str, Any]] = None,
+        proxy_rotator: Any = None,
     ) -> None:
         from session_store import load_session_file, normalize_cookies
 
@@ -558,6 +599,7 @@ class FetcherSession:
             retries=retries,
             follow_redirects=follow_redirects,
             verify=verify,
+            proxy_rotator=proxy_rotator,
         )
         self._entered = False
         self._cookie_jar = CookieJar()
@@ -601,6 +643,14 @@ class FetcherSession:
             if jar_map:
                 kwargs["cookies"] = jar_map
         return self._core.request(method, url, **kwargs)
+
+    @property
+    def last_proxy(self) -> Optional[str]:
+        return self._core.last_proxy
+
+    @property
+    def proxy_rotator(self) -> Any:
+        return self._core.proxy_rotator
 
     def get(self, url: str, **kwargs: Any) -> FetchResponse:
         return self.request("GET", url, **kwargs)
