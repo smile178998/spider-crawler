@@ -113,6 +113,7 @@ async def health():
             "stealth_fetcher",
             "dynamic_fetcher",
             "stealthy_fetcher",
+            "session_manager",
         ],
     }
 

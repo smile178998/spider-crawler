@@ -82,6 +82,8 @@ spaider_crawler/
 ├── fetcher.py          # 隐秘 HTTP 客户端（TLS 指纹 + HTTP/3，基于 curl_cffi）
 ├── dynamic_fetcher.py  # Playwright DynamicFetcher（Chromium / Google Chrome）
 ├── stealthy_fetcher.py # StealthyFetcher — 指纹伪装 + Cloudflare 挑战处理
+├── session_store.py    # Cookie / 状态持久化工具
+├── sessions.py         # 统一导出：FetcherSession / DynamicSession / StealthySession
 ├── video_platforms/    # 多平台视频元数据与流媒体提取
 │   ├── __init__.py     # 检测 / 提取 / 合并入口
 │   ├── registry.py     # 平台 URL 匹配与调度
@@ -378,6 +380,44 @@ print(r.title, r.extras.get("cloudflare_solved"), r.browser_engine)
 
 ---
 
+## Session 管理
+
+三类 Session 都在跨请求间保留 **Cookie** 和自定义 **`state`**，并可持久化到 JSON：
+
+| 类 | 引擎 | 适用场景 |
+|------|------|----------|
+| `FetcherSession` | curl_cffi HTTP | 登录 API、Token 刷新、CDN 下载 |
+| `DynamicSession` | Playwright | 多页 JS 流程，同一浏览器上下文 |
+| `StealthySession` | Patchright/Playwright | 带 Cloudflare 的多步流程 |
+
+统一 API：`get_cookies` / `set_cookies` / `clear_cookies` / `save` / `load` / `snapshot` / `restore` / `state`。
+
+```python
+from sessions import FetcherSession, DynamicSession, StealthySession
+
+# HTTP — 退出上下文时自动保存 cookies
+with FetcherSession(session_file=".sessions/api.json") as s:
+    s.get("https://httpbin.org/cookies/set?session=abc")
+    s.state["role"] = "user"
+    print(s.cookies_map())
+
+# 浏览器 — 同一 context，cookie 跨页面保留
+with DynamicSession(real_chrome=True, session_file=".sessions/web.json") as s:
+    s.fetch("https://example.com")
+    s.set_cookies({"sid": "xyz"}, url="https://example.com")
+    s.fetch("https://example.com/account")
+    snap = s.snapshot()
+
+# 稍后恢复
+with DynamicSession(real_chrome=True) as s:
+    s.restore(snap, url="https://example.com")
+    s.fetch("https://example.com/dashboard")
+```
+
+也可从各模块直接导入：`from fetcher import FetcherSession` 等。
+
+---
+
 ## API 参考
 
 ### `GET /api/health`
@@ -388,7 +428,7 @@ print(r.title, r.extras.get("cloudflare_solved"), r.browser_engine)
 {
   "status": "ok",
   "version": "1.3.0",
-  "features": ["video_platforms", "wbi_comments", "download_media", "saved_profile", "stealth_fetcher", "dynamic_fetcher", "stealthy_fetcher"]
+  "features": ["video_platforms", "wbi_comments", "download_media", "saved_profile", "stealth_fetcher", "dynamic_fetcher", "stealthy_fetcher", "session_manager"]
 }
 ```
 

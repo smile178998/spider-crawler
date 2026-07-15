@@ -13,8 +13,11 @@ import random
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
+from http.cookiejar import Cookie, CookieJar
+from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence, Union
 from urllib.parse import urlparse
+
 
 try:
     from curl_cffi import CurlHttpVersion
@@ -509,7 +512,21 @@ class Fetcher:
 
 
 class FetcherSession:
-    """Persistent session (cookies / connection reuse) with the same stealth options."""
+    """Persistent HTTP session — cookies and connection reuse across requests.
+
+    Uses ``curl_cffi.Session`` when available (TLS impersonation + cookie jar),
+    otherwise keeps an explicit ``CookieJar`` for urllib fallback.
+
+    Example::
+
+        from fetcher import FetcherSession
+
+        with FetcherSession(session_file=".sessions/http.json") as s:
+            s.get("https://example.com/login")
+            s.state["user"] = "alice"
+            s.post("https://example.com/api", json_body={"q": 1})
+            s.save()  # cookies + state → disk
+    """
 
     def __init__(
         self,
@@ -524,7 +541,12 @@ class FetcherSession:
         retries: int = 2,
         follow_redirects: bool = True,
         verify: bool = True,
+        cookies: Any = None,
+        session_file: Optional[Union[str, Path]] = None,
+        state: Optional[Mapping[str, Any]] = None,
     ) -> None:
+        from session_store import load_session_file, normalize_cookies
+
         self._core = _FetcherCore(
             impersonate=impersonate,
             stealthy_headers=stealthy_headers,
@@ -538,25 +560,46 @@ class FetcherSession:
             verify=verify,
         )
         self._entered = False
+        self._cookie_jar = CookieJar()
+        self._seed_cookies = cookies
+        self.state: dict[str, Any] = dict(state or {})
+        self._session_file = Path(session_file) if session_file else None
+        self._normalize_cookies = normalize_cookies
+
+        if self._session_file and self._session_file.is_file():
+            data = load_session_file(self._session_file)
+            self.state.update(dict(data.get("state") or {}))
+            if data.get("cookies") and not self._seed_cookies:
+                self._seed_cookies = data["cookies"]
 
     def __enter__(self) -> "FetcherSession":
         if self._entered:
             raise RuntimeError("FetcherSession already entered")
         if HAS_CURL_CFFI and CurlSession is not None:
-            session = CurlSession()
-            self._core.attach_session(session)
+            self._core.attach_session(CurlSession())
         self._entered = True
+        if self._seed_cookies:
+            self.set_cookies(self._seed_cookies)
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        self._core.close()
-        self._entered = False
+        if self._session_file:
+            try:
+                self.save()
+            except Exception:
+                pass
+        self.close()
+
+    def _ensure_open(self) -> None:
+        if not self._entered:
+            self.__enter__()
 
     def request(self, method: str, url: str, **kwargs: Any) -> FetchResponse:
-        if not self._entered and HAS_CURL_CFFI and CurlSession is not None:
-            # Allow use without context manager — open lazily
-            self._core.attach_session(CurlSession())
-            self._entered = True
+        self._ensure_open()
+        if "cookies" not in kwargs:
+            jar_map = self.cookies_map()
+            if jar_map:
+                kwargs["cookies"] = jar_map
         return self._core.request(method, url, **kwargs)
 
     def get(self, url: str, **kwargs: Any) -> FetchResponse:
@@ -571,9 +614,141 @@ class FetcherSession:
     def delete(self, url: str, **kwargs: Any) -> FetchResponse:
         return self.request("DELETE", url, **kwargs)
 
+    def head(self, url: str, **kwargs: Any) -> FetchResponse:
+        return self.request("HEAD", url, **kwargs)
+
     def close(self) -> None:
         self._core.close()
         self._entered = False
+
+    def get_cookies(self) -> list[dict[str, Any]]:
+        session = self._core._session
+        if session is not None and hasattr(session, "cookies"):
+            try:
+                jar = session.cookies
+                items: list[dict[str, Any]] = []
+                if hasattr(jar, "get_dict"):
+                    for name, value in jar.get_dict().items():
+                        items.append({"name": str(name), "value": str(value), "path": "/"})
+                elif hasattr(jar, "items"):
+                    for name, value in dict(jar).items():
+                        items.append({"name": str(name), "value": str(value), "path": "/"})
+                if items:
+                    return items
+            except Exception:
+                pass
+        items = []
+        for c in self._cookie_jar:
+            items.append(
+                {
+                    "name": c.name,
+                    "value": c.value,
+                    "domain": c.domain,
+                    "path": c.path or "/",
+                }
+            )
+        return items
+
+    def cookies_map(self) -> dict[str, str]:
+        from session_store import cookies_to_dict
+
+        return cookies_to_dict(self.get_cookies())
+
+    def cookies_header(self) -> str:
+        from session_store import cookies_to_header
+
+        return cookies_to_header(self.get_cookies())
+
+    def set_cookies(self, cookies: Any, url: str = "") -> None:
+        items = self._normalize_cookies(cookies, url=url)
+        self._ensure_open()
+        session = self._core._session
+        if session is not None and hasattr(session, "cookies"):
+            for c in items:
+                try:
+                    session.cookies.set(c["name"], c.get("value", ""))
+                except Exception:
+                    try:
+                        session.cookies[c["name"]] = c.get("value", "")
+                    except Exception:
+                        pass
+        for c in items:
+            domain = (
+                c.get("domain")
+                or urlparse(url or "https://example.com").hostname
+                or "example.com"
+            )
+            cookie = Cookie(
+                version=0,
+                name=c["name"],
+                value=str(c.get("value", "")),
+                port=None,
+                port_specified=False,
+                domain=domain,
+                domain_specified=True,
+                domain_initial_dot=str(domain).startswith("."),
+                path=c.get("path") or "/",
+                path_specified=True,
+                secure=bool(c.get("secure", False)),
+                expires=None,
+                discard=True,
+                comment=None,
+                comment_url=None,
+                rest={},
+                rfc2109=False,
+            )
+            try:
+                self._cookie_jar.set_cookie(cookie)
+            except Exception:
+                pass
+
+    def clear_cookies(self) -> None:
+        session = self._core._session
+        if session is not None and hasattr(session, "cookies"):
+            try:
+                session.cookies.clear()
+            except Exception:
+                pass
+        self._cookie_jar = CookieJar()
+
+    def save(self, path: Optional[Union[str, Path]] = None, **meta: Any) -> Path:
+        from session_store import save_session_file
+
+        target = Path(path) if path else self._session_file
+        if target is None:
+            raise ValueError("No path given and no session_file configured")
+        return save_session_file(
+            target,
+            cookies=self.get_cookies(),
+            state=self.state,
+            meta={"kind": "FetcherSession", **meta},
+        )
+
+    def load(self, path: Optional[Union[str, Path]] = None, *, url: str = "") -> None:
+        from session_store import load_session_file
+
+        target = Path(path) if path else self._session_file
+        if target is None or not Path(target).is_file():
+            raise FileNotFoundError(f"Session file not found: {target}")
+        data = load_session_file(target)
+        self.state.update(dict(data.get("state") or {}))
+        if data.get("cookies"):
+            self.set_cookies(data["cookies"], url=url)
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "cookies": self.get_cookies(),
+            "state": dict(self.state),
+            "kind": "FetcherSession",
+        }
+
+    def restore(self, snapshot: Mapping[str, Any], *, url: str = "") -> None:
+        if snapshot.get("state"):
+            self.state.update(dict(snapshot["state"]))
+        if snapshot.get("cookies"):
+            self.set_cookies(snapshot["cookies"], url=url)
+
+
 
 
 def fetch_bytes(

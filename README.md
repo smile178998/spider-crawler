@@ -82,6 +82,8 @@ spaider_crawler/
 ├── fetcher.py          # Stealth HTTP client (TLS fingerprint + HTTP/3 via curl_cffi)
 ├── dynamic_fetcher.py  # Playwright DynamicFetcher (Chromium / Google Chrome)
 ├── stealthy_fetcher.py # StealthyFetcher — fingerprint spoofing + Cloudflare solver
+├── session_store.py    # Cookie / state persistence helpers
+├── sessions.py         # Unified exports: FetcherSession / DynamicSession / StealthySession
 ├── video_platforms/    # Multi-platform video metadata + stream extraction
 │   ├── __init__.py     # detect / extract / merge entry points
 │   ├── registry.py     # Platform URL matching and dispatch
@@ -378,6 +380,44 @@ print(r.title, r.extras.get("cloudflare_solved"), r.browser_engine)
 
 ---
 
+## Session management
+
+All three session classes keep **cookies** and a custom **`state`** dict across requests, and can persist to JSON:
+
+| Class | Engine | Best for |
+|-------|--------|----------|
+| `FetcherSession` | curl_cffi HTTP | Login APIs, token refresh, CDN downloads |
+| `DynamicSession` | Playwright | Multi-page JS flows, same browser context |
+| `StealthySession` | Patchright/Playwright | CF-protected multi-step flows |
+
+Shared API: `get_cookies` / `set_cookies` / `clear_cookies` / `save` / `load` / `snapshot` / `restore` / `state`.
+
+```python
+from sessions import FetcherSession, DynamicSession, StealthySession
+
+# HTTP — cookies auto-saved on context exit
+with FetcherSession(session_file=".sessions/api.json") as s:
+    s.get("https://httpbin.org/cookies/set?session=abc")
+    s.state["role"] = "user"
+    print(s.cookies_map())
+
+# Browser — one context, cookies survive across pages
+with DynamicSession(real_chrome=True, session_file=".sessions/web.json") as s:
+    s.fetch("https://example.com")
+    s.set_cookies({"sid": "xyz"}, url="https://example.com")
+    s.fetch("https://example.com/account")
+    snap = s.snapshot()
+
+# Resume later
+with DynamicSession(real_chrome=True) as s:
+    s.restore(snap, url="https://example.com")
+    s.fetch("https://example.com/dashboard")
+```
+
+Or import sessions from their modules: `from fetcher import FetcherSession`, etc.
+
+---
+
 ## API reference
 
 ### `GET /api/health`
@@ -388,7 +428,7 @@ Health check and version info.
 {
   "status": "ok",
   "version": "1.3.0",
-  "features": ["video_platforms", "wbi_comments", "download_media", "saved_profile", "stealth_fetcher", "dynamic_fetcher", "stealthy_fetcher"]
+  "features": ["video_platforms", "wbi_comments", "download_media", "saved_profile", "stealth_fetcher", "dynamic_fetcher", "stealthy_fetcher", "session_manager"]
 }
 ```
 

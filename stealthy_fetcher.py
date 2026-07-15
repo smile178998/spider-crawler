@@ -32,7 +32,6 @@ from dynamic_fetcher import (
     _as_bool_chrome,
     _normalize_proxy,
     _pick_profile,
-    _inject_cookies,
     _block_heavy_resources,
 )
 
@@ -453,12 +452,22 @@ class _StealthOptions:
 
 
 class StealthySession:
-    """Persistent stealth browser session (patchright preferred)."""
+    """Persistent stealth browser session — cookies / profile / state across fetches.
+
+    Example::
+
+        with StealthySession(session_file=".sessions/stealth.json", solve_cloudflare=True) as s:
+            s.fetch("https://protected.example/login")
+            s.state["authed"] = True
+            s.fetch("https://protected.example/dashboard")
+            s.save()
+    """
 
     def __init__(self, **kwargs: Any) -> None:
+        session_file = kwargs.pop("session_file", None)
+        state = kwargs.pop("state", None)
         real_chrome = _as_bool_chrome(kwargs)
         solve_cf = bool(kwargs.pop("solve_cloudflare", True))
-        # Scrapling auto-enables humanize with CF solver
         humanize = bool(kwargs.pop("humanize", solve_cf or True))
         timeout = int(kwargs.pop("timeout", DEFAULT_TIMEOUT_MS if solve_cf else 30_000))
 
@@ -514,7 +523,18 @@ class StealthySession:
         self._engine = ENGINE_NAME
         self._browser_label = ""
         self._entered = False
+        self._cookies_seeded = False
         self._log: Callable[[str], None] = lambda _m: None
+        self.state: dict[str, Any] = dict(state or {})
+        self._session_file = Path(session_file) if session_file else None
+
+        if self._session_file and self._session_file.is_file():
+            from session_store import load_session_file
+
+            data = load_session_file(self._session_file)
+            self.state.update(dict(data.get("state") or {}))
+            if data.get("cookies") and not self.opts.cookies:
+                self.opts.cookies = data["cookies"]
 
     def set_logger(self, log: Callable[[str], None]) -> None:
         self._log = log
@@ -525,6 +545,9 @@ class StealthySession:
         self._pw = _sync_playwright().start()
         self._browser, self._context, self._browser_label = self._launch(self._pw)
         self._entered = True
+        if self.opts.cookies:
+            self.set_cookies(self.opts.cookies)
+            self._cookies_seeded = True
         self._log(
             f"[Stealthy] Engine={self._engine} browser={self._browser_label} "
             f"patchright={HAS_PATCHRIGHT}"
@@ -532,6 +555,11 @@ class StealthySession:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
+        if self._session_file:
+            try:
+                self.save()
+            except Exception:
+                pass
         self.close()
 
     def close(self) -> None:
@@ -761,7 +789,7 @@ class StealthySession:
                     {str(k): str(v) for k, v in dict(extra_headers).items()}
                 )
 
-            _inject_cookies(self._context, opts.cookies, url)
+            # Seed cookies only once; thereafter context holds them
 
             if page_setup:
                 page_setup(page)
@@ -845,6 +873,83 @@ class StealthySession:
                 pass
             if owns:
                 self.close()
+
+    def get_cookies(self) -> list[dict[str, Any]]:
+        if self._context is None:
+            return []
+        try:
+            return [dict(c) for c in self._context.cookies()]
+        except Exception:
+            return []
+
+    def cookies_map(self) -> dict[str, str]:
+        from session_store import cookies_to_dict
+
+        return cookies_to_dict(self.get_cookies())
+
+    def cookies_header(self) -> str:
+        from session_store import cookies_to_header
+
+        return cookies_to_header(self.get_cookies())
+
+    def set_cookies(self, cookies: CookieInput, url: str = "") -> None:
+        if self._context is None:
+            self.opts.cookies = cookies
+            return
+        from session_store import normalize_cookies
+
+        items = normalize_cookies(cookies, url=url or "https://example.com")
+        if items:
+            self._context.add_cookies(items)
+
+    def clear_cookies(self) -> None:
+        if self._context is not None:
+            try:
+                self._context.clear_cookies()
+            except Exception:
+                pass
+
+    def save(self, path: Optional[Union[str, Path]] = None, **meta: Any) -> Path:
+        from session_store import save_session_file
+
+        target = Path(path) if path else self._session_file
+        if target is None:
+            raise ValueError("No path given and no session_file configured")
+        return save_session_file(
+            target,
+            cookies=self.get_cookies(),
+            state=self.state,
+            meta={
+                "kind": "StealthySession",
+                "engine": self._engine,
+                "browser": self._browser_label,
+                **meta,
+            },
+        )
+
+    def load(self, path: Optional[Union[str, Path]] = None, *, url: str = "") -> None:
+        from session_store import load_session_file
+
+        target = Path(path) if path else self._session_file
+        if target is None or not Path(target).is_file():
+            raise FileNotFoundError(f"Session file not found: {target}")
+        data = load_session_file(target)
+        self.state.update(dict(data.get("state") or {}))
+        if data.get("cookies"):
+            self.set_cookies(data["cookies"], url=url)
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "cookies": self.get_cookies(),
+            "state": dict(self.state),
+            "kind": "StealthySession",
+        }
+
+    def restore(self, snapshot: Mapping[str, Any], *, url: str = "") -> None:
+        if snapshot.get("state"):
+            self.state.update(dict(snapshot["state"]))
+        if snapshot.get("cookies"):
+            self.set_cookies(snapshot["cookies"], url=url)  # type: ignore[arg-type]
 
 
 class StealthyFetcher:
