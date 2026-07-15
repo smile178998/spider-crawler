@@ -26,7 +26,8 @@ A Playwright-powered web scraper with a FastAPI UI, plus a three-tier programmat
 | **Tier 1 — HTTP** | `fetcher.py` | Fast stealth requests (`curl_cffi`): TLS fingerprint, headers, optional HTTP/3 |
 | **Tier 2 — Browser** | `dynamic_fetcher.py` | Playwright Chromium / Google Chrome for JS/SPA pages |
 | **Tier 3 — Stealth** | `stealthy_fetcher.py` | Patchright/Playwright + fingerprint spoofing + Cloudflare UI flow |
-| **Sessions** | `sessions.py` | `FetcherSession` / `DynamicSession` / `StealthySession` — cookies + state |
+| **Sessions** | `sessions.py` | Sync + async Session classes — cookies + state |
+| **Async** | `async_*_fetcher.py` + `AsyncFetcher*` | Full `asyncio` twins for every Fetcher / Session |
 | **Proxy** | `proxy_rotator.py` | Round-robin / random / custom rotation; per-request override |
 | **DNS** | `doh.py` | Optional Cloudflare DNS-over-HTTPS (leak protection with proxies) |
 | **Blocking** | `request_blocking.py` | `blocked_domains` + `block_ads` (~3,500 trackers) |
@@ -70,6 +71,7 @@ A Playwright-powered web scraper with a FastAPI UI, plus a three-tier programmat
 - Proxy via UI / `SCRAPER_PROXY` / `HTTP_PROXY`; dead env proxies skipped
 - **ProxyRotator** for all Sessions; **domain/ad blocking** on browser fetchers
 - **DNS-over-HTTPS** — optional Cloudflare DoH (`dns_over_https=True` / `SCRAPER_DOH=1`) to prevent DNS leaks when using proxies
+- **Async** — `AsyncFetcher` / `AsyncDynamicFetcher` / `AsyncStealthyFetcher` and matching `Async*Session` classes
 - Port auto-select if 8000 is busy (8001+)
 
 ---
@@ -82,11 +84,13 @@ spaider_crawler/
 ├── scraper_core.py        # Main Playwright scrape pipeline
 ├── selector_engine.py     # Heuristic + AI selector discovery
 ├── media_downloader.py    # Image/video download, ffmpeg, MIME
-├── fetcher.py             # Stealth HTTP (curl_cffi)
+├── fetcher.py             # Stealth HTTP + AsyncFetcher (curl_cffi)
 ├── dynamic_fetcher.py     # Playwright DynamicFetcher
+├── async_dynamic_fetcher.py  # AsyncDynamicSession / AsyncDynamicFetcher
 ├── stealthy_fetcher.py    # StealthyFetcher + CF challenge flow
+├── async_stealthy_fetcher.py # AsyncStealthySession / AsyncStealthyFetcher
 ├── session_store.py       # Cookie / state JSON helpers
-├── sessions.py            # Unified session exports
+├── sessions.py            # Unified sync + async session exports
 ├── proxy_rotator.py       # Proxy rotation strategies
 ├── doh.py                 # Cloudflare DNS-over-HTTPS helpers
 ├── request_blocking.py    # Domain + ad request blocking
@@ -219,6 +223,21 @@ with FetcherSession(session_file=".sessions/api.json") as s:
 
 Uses `curl_cffi` for TLS/JA3 impersonation; falls back to `urllib` if missing.
 
+```python
+import asyncio
+from fetcher import AsyncFetcher, AsyncFetcherSession
+
+async def main():
+    r = await AsyncFetcher.get("https://example.com", stealthy_headers=True)
+    async with AsyncFetcherSession(session_file=".sessions/api.json") as s:
+        await s.get("https://example.com/login")
+        await s.save()
+
+asyncio.run(main())
+```
+
+Or via sync class helpers: `await Fetcher.async_get(...)`.
+
 ### Tier 2 — `DynamicFetcher` (browser)
 
 ```python
@@ -263,12 +282,17 @@ r = StealthyFetcher.fetch(
 
 ```python
 from sessions import FetcherSession, DynamicSession, StealthySession
+from sessions import AsyncFetcherSession, AsyncDynamicSession, AsyncStealthySession
 from sessions import ProxyRotator, random_rotation
 
 # Shared API: get/set/clear cookies, save/load/snapshot/restore, state={}
 with FetcherSession(session_file=".sessions/api.json") as s:
     s.set_cookies({"token": "x"}, url="https://example.com")
     s.save()
+
+# Async sessions
+async with AsyncDynamicSession(real_chrome=True) as s:
+    await s.fetch("https://example.com")
 
 rotator = ProxyRotator([
     "http://1.2.3.4:8080",
@@ -305,7 +329,8 @@ Set `SCRAPER_DOH=1` (or `DNS_OVER_HTTPS=true`) to enable DoH by default for the 
   "features": [
     "video_platforms", "wbi_comments", "download_media", "saved_profile",
     "stealth_fetcher", "dynamic_fetcher", "stealthy_fetcher",
-    "session_manager", "proxy_rotator", "request_blocking", "dns_over_https"
+    "session_manager", "proxy_rotator", "request_blocking", "dns_over_https",
+    "async_fetchers"
   ]
 }
 ```

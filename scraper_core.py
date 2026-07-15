@@ -12,7 +12,7 @@ import socket
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
@@ -484,6 +484,19 @@ def _simulate_human(page: Page, viewport: dict) -> None:
         page.wait_for_timeout(random.randint(80, 220))
     page.mouse.wheel(0, random.randint(120, 360))
     page.wait_for_timeout(random.randint(150, 400))
+
+
+async def _simulate_human_async(page: Any, viewport: dict) -> None:
+    """Async twin of :func:`_simulate_human` for ``playwright.async_api`` pages."""
+    width = viewport["width"]
+    height = viewport["height"]
+    for _ in range(random.randint(2, 4)):
+        x = random.randint(80, max(120, width - 80))
+        y = random.randint(80, max(120, height - 80))
+        await page.mouse.move(x, y, steps=random.randint(8, 20))
+        await page.wait_for_timeout(random.randint(80, 220))
+    await page.mouse.wheel(0, random.randint(120, 360))
+    await page.wait_for_timeout(random.randint(150, 400))
 
 
 def _human_scroll(page: Page) -> None:

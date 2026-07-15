@@ -26,7 +26,8 @@
 | **第一层 — HTTP** | `fetcher.py` | 快速隐秘请求（`curl_cffi`）：TLS 指纹、标头、可选 HTTP/3 |
 | **第二层 — 浏览器** | `dynamic_fetcher.py` | Playwright Chromium / Google Chrome，适合 JS/SPA |
 | **第三层 — 隐秘** | `stealthy_fetcher.py` | Patchright/Playwright + 指纹伪装 + Cloudflare 挑战流程 |
-| **Session** | `sessions.py` | `FetcherSession` / `DynamicSession` / `StealthySession` — Cookie + 状态 |
+| **Session** | `sessions.py` | 同步 + 异步 Session — Cookie + 状态 |
+| **Async** | `async_*_fetcher.py` + `AsyncFetcher*` | 全 Fetcher / Session 的 `asyncio` 双生 |
 | **代理** | `proxy_rotator.py` | 轮询 / 随机 / 自定义轮换；支持单次请求覆盖 |
 | **DNS** | `doh.py` | 可选 Cloudflare DNS-over-HTTPS（配合代理防 DNS 泄漏） |
 | **屏蔽** | `request_blocking.py` | `blocked_domains` + `block_ads`（约 3500 个追踪域名） |
@@ -70,6 +71,7 @@
 - UI / `SCRAPER_PROXY` / `HTTP_PROXY` 代理；失效环境代理自动跳过
 - 全 Session **ProxyRotator**；浏览器 Fetcher **域名/广告屏蔽**
 - **DNS-over-HTTPS** — 可选 Cloudflare DoH（`dns_over_https=True` / `SCRAPER_DOH=1`），防止使用代理时 DNS 泄漏
+- **Async** — `AsyncFetcher` / `AsyncDynamicFetcher` / `AsyncStealthyFetcher` 及对应 `Async*Session`
 - 端口占用时自动换到 8001+
 
 ---
@@ -82,11 +84,13 @@ spaider_crawler/
 ├── scraper_core.py        # 主 Playwright 抓取管道
 ├── selector_engine.py     # 启发式 + AI 选择器发现
 ├── media_downloader.py    # 图片/视频下载、ffmpeg、MIME
-├── fetcher.py             # 隐秘 HTTP（curl_cffi）
+├── fetcher.py             # 隐秘 HTTP + AsyncFetcher（curl_cffi）
 ├── dynamic_fetcher.py     # Playwright DynamicFetcher
+├── async_dynamic_fetcher.py  # AsyncDynamicSession / AsyncDynamicFetcher
 ├── stealthy_fetcher.py    # StealthyFetcher + CF 挑战流程
+├── async_stealthy_fetcher.py # AsyncStealthySession / AsyncStealthyFetcher
 ├── session_store.py       # Cookie / 状态 JSON 工具
-├── sessions.py            # Session 统一导出
+├── sessions.py            # 同步 + 异步 Session 统一导出
 ├── proxy_rotator.py       # 代理轮换策略
 ├── doh.py                 # Cloudflare DNS-over-HTTPS
 ├── request_blocking.py    # 域名 + 广告请求屏蔽
@@ -219,6 +223,21 @@ with FetcherSession(session_file=".sessions/api.json") as s:
 
 基于 `curl_cffi` 做 TLS/JA3 伪装；未安装时回退 `urllib`。
 
+```python
+import asyncio
+from fetcher import AsyncFetcher, AsyncFetcherSession
+
+async def main():
+    r = await AsyncFetcher.get("https://example.com", stealthy_headers=True)
+    async with AsyncFetcherSession(session_file=".sessions/api.json") as s:
+        await s.get("https://example.com/login")
+        await s.save()
+
+asyncio.run(main())
+```
+
+也可：`await Fetcher.async_get(...)`。
+
 ### 第二层 — `DynamicFetcher`（浏览器）
 
 ```python
@@ -263,12 +282,17 @@ r = StealthyFetcher.fetch(
 
 ```python
 from sessions import FetcherSession, DynamicSession, StealthySession
+from sessions import AsyncFetcherSession, AsyncDynamicSession, AsyncStealthySession
 from sessions import ProxyRotator, random_rotation
 
 # 统一 API：get/set/clear cookies、save/load/snapshot/restore、state={}
 with FetcherSession(session_file=".sessions/api.json") as s:
     s.set_cookies({"token": "x"}, url="https://example.com")
     s.save()
+
+# 异步 Session
+async with AsyncDynamicSession(real_chrome=True) as s:
+    await s.fetch("https://example.com")
 
 rotator = ProxyRotator([
     "http://1.2.3.4:8080",
@@ -305,7 +329,8 @@ Web UI 管道可设 `SCRAPER_DOH=1`（或 `DNS_OVER_HTTPS=true`）默认开启 D
   "features": [
     "video_platforms", "wbi_comments", "download_media", "saved_profile",
     "stealth_fetcher", "dynamic_fetcher", "stealthy_fetcher",
-    "session_manager", "proxy_rotator", "request_blocking", "dns_over_https"
+    "session_manager", "proxy_rotator", "request_blocking", "dns_over_https",
+    "async_fetchers"
   ]
 }
 ```

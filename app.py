@@ -118,6 +118,7 @@ async def health():
             "proxy_rotator",
             "request_blocking",
             "dns_over_https",
+            "async_fetchers",
         ],
     }
 

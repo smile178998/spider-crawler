@@ -1,30 +1,74 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Dynamic page loader via Playwright — Chromium or system Google Chrome.
+"""Async dynamic page loader via Playwright — Chromium or system Google Chrome.
 
-Complement to the stealth HTTP ``Fetcher``: use this when the page needs a
-real browser (JavaScript, SPAs, lazy content). API shaped after Scrapling's
-``DynamicFetcher``.
+Async twin of :class:`dynamic_fetcher.DynamicSession` /
+:class:`dynamic_fetcher.DynamicFetcher`. Use when the page needs a real
+browser under ``asyncio``.
+
+Example::
+
+    import asyncio
+    from async_dynamic_fetcher import AsyncDynamicFetcher, AsyncDynamicSession
+
+    async def main() -> None:
+        r = await AsyncDynamicFetcher.fetch(
+            "https://spa.example.com",
+            real_chrome=True,
+            network_idle=True,
+            wait=1500,
+        )
+        print(r.title, r.status_code, len(r.text))
+
+        async with AsyncDynamicSession(session_file=".sessions/dyn.json") as s:
+            await s.fetch("https://example.com/login")
+            s.state["step"] = "logged_in"
+            await s.fetch("https://example.com/dashboard")
+            await s.save()
+
+    asyncio.run(main())
 """
 
 from __future__ import annotations
 
-import random
+import asyncio
+import inspect
 import time
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional, Sequence, Union
+from typing import Any, Mapping, Optional, Sequence, Union
+from urllib.parse import urlparse
 
-from playwright.sync_api import (
+from playwright.async_api import (
     Browser,
     BrowserContext,
     Page,
     Playwright,
     Response as PWResponse,
-    sync_playwright,
+    async_playwright,
 )
 
-from fetcher import FetchError, FetchResponse
+from fetcher import FetchError
+from scraper_core import (
+    BROWSER_ARGS,
+    _build_headers,
+    _stealth_init_script,
+)
+
+from dynamic_fetcher import (
+    CookieInput,
+    DEFAULT_TIMEOUT_MS,
+    DEFAULT_WAIT_MS,
+    DynamicFetchResult,
+    PageAction,
+    ProxyInput,
+    _SessionOptions,
+    _as_bool_chrome,
+    _inject_cookies,  # noqa: F401 — re-exported for parity / callers
+    _normalize_proxy,
+    _overrides_to_opts,
+    _pick_profile,
+    field_replace,
+)
 
 try:
     from playwright_stealth import Stealth
@@ -34,133 +78,57 @@ try:
 except ImportError:
     HAS_STEALTH = False
 
-# Reuse hardened launch defaults from the main scrape pipeline.
-from scraper_core import (  # noqa: E402
-    BROWSER_ARGS,
-    BROWSER_PROFILES,
-    _build_headers,
-    _parse_cookies,
-    _parse_proxy,
-    _stealth_init_script,
-)
 
-PageAction = Callable[[Page], Any]
-CookieInput = Union[str, Sequence[Mapping[str, Any]], None]
-ProxyInput = Union[str, Mapping[str, str], None]
-
-DEFAULT_TIMEOUT_MS = 30_000
-DEFAULT_WAIT_MS = 0
+async def _maybe_await(value: Any) -> Any:
+    if inspect.isawaitable(value):
+        return await value
+    return value
 
 
-@dataclass
-class DynamicFetchResult(FetchResponse):
-    """Browser-rendered response with useful page metadata in ``extras``."""
+async def _apply_request_blocking_async(
+    page: Page,
+    *,
+    disable_resources: bool = False,
+    blocked_domains: Optional[Sequence[str]] = None,
+    block_ads: bool = False,
+) -> bool:
+    """Async port of :func:`request_blocking.apply_request_blocking`."""
+    from request_blocking import (
+        HEAVY_RESOURCES,
+        is_domain_blocked,
+        merge_blocked_domains,
+    )
 
-    title: str = ""
-    browser_engine: str = ""  # "chrome" | "chromium"
-    final_url: str = ""
+    heavy = HEAVY_RESOURCES if disable_resources else frozenset()
+    domains = merge_blocked_domains(blocked_domains, block_ads=block_ads)
+    if not heavy and not domains:
+        return False
 
+    async def handler(route: Any) -> None:
+        try:
+            req = route.request
+            rtype = req.resource_type
+            if rtype in heavy:
+                await route.abort()
+                return
+            if domains:
+                hostname = urlparse(req.url).hostname or ""
+                if is_domain_blocked(hostname, domains):
+                    await route.abort()
+                    return
+            await route.continue_()
+        except Exception:
+            try:
+                await route.continue_()
+            except Exception:
+                pass
 
-@dataclass
-class _SessionOptions:
-    headless: bool = True
-    real_chrome: bool = True
-    disable_resources: bool = False
-    blocked_domains: Optional[Sequence[str]] = None
-    block_ads: bool = False
-    network_idle: bool = False
-    load_dom: bool = True
-    timeout: int = DEFAULT_TIMEOUT_MS
-    wait: int = DEFAULT_WAIT_MS
-    wait_selector: Optional[str] = None
-    wait_selector_state: str = "attached"
-    useragent: Optional[str] = None
-    cookies: CookieInput = None
-    locale: Optional[str] = None
-    proxy: ProxyInput = None
-    google_search: bool = True
-    extra_headers: Optional[Mapping[str, str]] = None
-    extra_flags: Optional[Sequence[str]] = None
-    init_script: Optional[str] = None
-    page_action: Optional[PageAction] = None
-    page_setup: Optional[PageAction] = None
-    cdp_url: Optional[str] = None
-    additional_args: Optional[Mapping[str, Any]] = None
-    simulate_stealth: bool = True
-    viewport: Optional[Mapping[str, int]] = None
-    dns_over_https: bool = False
-
-
-def _as_bool_chrome(kwargs: dict[str, Any]) -> bool:
-    """Accept Scrapling ``real_chrome`` or project ``use_chrome``."""
-    if "real_chrome" in kwargs:
-        return bool(kwargs.pop("real_chrome"))
-    if "use_chrome" in kwargs:
-        return bool(kwargs.pop("use_chrome"))
+    await page.route("**/*", handler)
     return True
 
 
-def _normalize_proxy(proxy: ProxyInput) -> Optional[dict]:
-    if not proxy:
-        return None
-    if isinstance(proxy, Mapping):
-        server = str(proxy.get("server") or "").strip()
-        if not server:
-            return None
-        out: dict[str, str] = {"server": server}
-        if proxy.get("username"):
-            out["username"] = str(proxy["username"])
-        if proxy.get("password"):
-            out["password"] = str(proxy["password"])
-        return out
-    return _parse_proxy(str(proxy))
-
-
-def _pick_profile(
-    useragent: Optional[str],
-    locale: Optional[str],
-    viewport: Optional[Mapping[str, int]],
-) -> dict:
-    profile = dict(random.choice(BROWSER_PROFILES))
-    if useragent:
-        profile["ua"] = useragent
-    if locale:
-        profile["locale"] = locale
-    if viewport:
-        profile["viewport"] = {
-            "width": int(viewport.get("width", 1280)),
-            "height": int(viewport.get("height", 720)),
-        }
-    return profile
-
-
-def _inject_cookies(ctx: BrowserContext, cookies: CookieInput, url: str) -> None:
-    if not cookies:
-        return
-    if isinstance(cookies, str):
-        parsed = _parse_cookies(cookies, url)
-        if parsed:
-            ctx.add_cookies(parsed)
-        return
-    items: list[dict[str, Any]] = []
-    for item in cookies:
-        c = dict(item)
-        if "url" not in c and "domain" not in c:
-            c["url"] = url
-        items.append(c)
-    if items:
-        ctx.add_cookies(items)
-
-
-def _block_heavy_resources(page: Page) -> None:
-    """Backward-compatible helper — prefer :func:`request_blocking.apply_request_blocking`."""
-    from request_blocking import apply_request_blocking
-
-    apply_request_blocking(page, disable_resources=True)
-
-
-class DynamicSession:
-    """Reusable Playwright session with persistent cookies / storage across fetches.
+class AsyncDynamicSession:
+    """Reusable async Playwright session with persistent cookies / storage.
 
     One browser context is shared for the lifetime of the session, so login
     cookies, ``localStorage`` (same origin), and custom ``state`` survive
@@ -168,11 +136,13 @@ class DynamicSession:
 
     Example::
 
-        with DynamicSession(real_chrome=True, session_file=".sessions/dyn.json") as s:
-            s.fetch("https://example.com/login")
+        async with AsyncDynamicSession(
+            real_chrome=True, session_file=".sessions/dyn.json"
+        ) as s:
+            await s.fetch("https://example.com/login")
             s.state["step"] = "logged_in"
-            s.fetch("https://example.com/dashboard")
-            s.save()
+            await s.fetch("https://example.com/dashboard")
+            await s.save()
     """
 
     def __init__(self, **kwargs: Any) -> None:
@@ -241,53 +211,52 @@ class DynamicSession:
             if data.get("cookies") and not self.opts.cookies:
                 self.opts.cookies = data["cookies"]
 
-    def __enter__(self) -> "DynamicSession":
+    async def __aenter__(self) -> "AsyncDynamicSession":
         if self._entered:
-            raise RuntimeError("DynamicSession already entered")
-        self._pw = sync_playwright().start()
-        self._browser, self._browser_engine = self._launch(self._pw)
-        self._context = self._new_context(self._browser, "https://example.com")
+            raise RuntimeError("AsyncDynamicSession already entered")
+        self._pw = await async_playwright().start()
+        self._browser, self._browser_engine = await self._launch(self._pw)
+        self._context = await self._new_context(self._browser, "https://example.com")
         self._owns_browser = True
         self._entered = True
         if self.opts.cookies:
-            self.set_cookies(self.opts.cookies)
+            await self.set_cookies(self.opts.cookies)
             self._cookies_seeded = True
         return self
 
-    def __exit__(self, exc_type, exc, tb) -> None:
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
         if self._session_file:
             try:
-                self.save()
+                await self.save()
             except Exception:
                 pass
-        self.close()
+        await self.close()
 
-    def close(self) -> None:
+    async def close(self) -> None:
         if self._context is not None:
             try:
-                self._context.close()
+                await self._context.close()
             except Exception:
                 pass
         self._context = None
         if self._browser is not None and self._owns_browser:
             try:
-                self._browser.close()
+                await self._browser.close()
             except Exception:
                 pass
         self._browser = None
         if self._pw is not None:
             try:
-                self._pw.stop()
+                await self._pw.stop()
             except Exception:
                 pass
         self._pw = None
         self._entered = False
 
-
-    def _launch(self, pw: Playwright) -> tuple[Browser, str]:
+    async def _launch(self, pw: Playwright) -> tuple[Browser, str]:
         opts = self.opts
         if opts.cdp_url:
-            browser = pw.chromium.connect_over_cdp(opts.cdp_url)
+            browser = await pw.chromium.connect_over_cdp(opts.cdp_url)
             return browser, "cdp"
 
         from doh import apply_chromium_doh
@@ -308,32 +277,32 @@ class DynamicSession:
 
         errors: list[str] = []
 
-        def try_chrome() -> Optional[Browser]:
+        async def try_chrome() -> Optional[Browser]:
             try:
-                return pw.chromium.launch(channel="chrome", **launch_kwargs)
+                return await pw.chromium.launch(channel="chrome", **launch_kwargs)
             except Exception as exc:
                 errors.append(f"chrome: {exc}")
                 return None
 
-        def try_chromium() -> Optional[Browser]:
+        async def try_chromium() -> Optional[Browser]:
             try:
-                return pw.chromium.launch(**launch_kwargs)
+                return await pw.chromium.launch(**launch_kwargs)
             except Exception as exc:
                 errors.append(f"chromium: {exc}")
                 return None
 
         if opts.real_chrome:
-            browser = try_chrome()
+            browser = await try_chrome()
             if browser is not None:
                 return browser, "chrome"
-            browser = try_chromium()
+            browser = await try_chromium()
             if browser is not None:
                 return browser, "chromium"
         else:
-            browser = try_chromium()
+            browser = await try_chromium()
             if browser is not None:
                 return browser, "chromium"
-            browser = try_chrome()
+            browser = await try_chrome()
             if browser is not None:
                 return browser, "chrome"
 
@@ -358,7 +327,7 @@ class DynamicSession:
         self.last_proxy = proxy_to_url(parsed) if parsed else None
         return parsed
 
-    def _context_for_proxy(
+    async def _context_for_proxy(
         self, proxy: Optional[dict], url: str
     ) -> tuple[BrowserContext, bool]:
         """Return ``(context, ephemeral)``. Ephemeral = per-request proxied context."""
@@ -400,20 +369,20 @@ class DynamicSession:
         }
         if self.opts.additional_args:
             ctx_kwargs.update(dict(self.opts.additional_args))
-        ctx = self._browser.new_context(**ctx_kwargs)
+        ctx = await self._browser.new_context(**ctx_kwargs)
         if self.opts.simulate_stealth:
-            ctx.add_init_script(
+            await ctx.add_init_script(
                 _stealth_init_script(profile["languages"], profile["navigator_platform"])
             )
-        existing = self.get_cookies()
+        existing = await self.get_cookies()
         if existing:
             try:
-                ctx.add_cookies(existing)
+                await ctx.add_cookies(existing)
             except Exception:
                 pass
         return ctx, True
 
-    def _new_context(self, browser: Browser, url: str) -> BrowserContext:
+    async def _new_context(self, browser: Browser, url: str) -> BrowserContext:
         opts = self.opts
         profile = _pick_profile(opts.useragent, opts.locale, opts.viewport)
         viewport = profile["viewport"]
@@ -439,20 +408,20 @@ class DynamicSession:
         if opts.additional_args:
             ctx_kwargs.update(dict(opts.additional_args))
 
-        ctx = browser.new_context(**ctx_kwargs)
+        ctx = await browser.new_context(**ctx_kwargs)
         if opts.simulate_stealth:
-            ctx.add_init_script(
+            await ctx.add_init_script(
                 _stealth_init_script(profile["languages"], profile["navigator_platform"])
             )
         if opts.init_script:
             path = Path(opts.init_script)
             if path.is_file():
-                ctx.add_init_script(path=str(path))
+                await ctx.add_init_script(path=str(path))
             else:
-                ctx.add_init_script(opts.init_script)
+                await ctx.add_init_script(opts.init_script)
         return ctx
 
-    def fetch(self, url: str, **overrides: Any) -> DynamicFetchResult:
+    async def fetch(self, url: str, **overrides: Any) -> DynamicFetchResult:
         """Navigate and return the rendered page; reuses one BrowserContext."""
         if not url or not str(url).strip():
             raise FetchError("URL is required")
@@ -472,7 +441,7 @@ class DynamicSession:
         ctx: Optional[BrowserContext] = None
         try:
             if not self._entered:
-                self.__enter__()
+                await self.__aenter__()
                 owns_runtime = True
 
             assert self._browser is not None
@@ -483,28 +452,26 @@ class DynamicSession:
             if fetch_proxy is not None and (
                 self._proxy_rotator is not None or self.opts.proxy is None
             ):
-                ctx, ephemeral = self._context_for_proxy(fetch_proxy, url)
+                ctx, ephemeral = await self._context_for_proxy(fetch_proxy, url)
             elif fetch_proxy is not None:
                 # Override static session proxy for this request only
-                ctx, ephemeral = self._context_for_proxy(fetch_proxy, url)
+                ctx, ephemeral = await self._context_for_proxy(fetch_proxy, url)
             else:
                 ctx, ephemeral = self._context, False
 
-            page = ctx.new_page()
+            page = await ctx.new_page()
             page.set_default_timeout(self.opts.timeout)
 
             try:
                 if HAS_STEALTH and self.opts.simulate_stealth:
-                    _stealth.apply_stealth_sync(page)
+                    await _stealth.apply_stealth_async(page)
 
                 if (
                     self.opts.disable_resources
                     or self.opts.block_ads
                     or self.opts.blocked_domains
                 ):
-                    from request_blocking import apply_request_blocking
-
-                    apply_request_blocking(
+                    await _apply_request_blocking_async(
                         page,
                         disable_resources=self.opts.disable_resources,
                         blocked_domains=self.opts.blocked_domains,
@@ -512,39 +479,39 @@ class DynamicSession:
                     )
 
                 if self.opts.page_setup:
-                    self.opts.page_setup(page)
+                    await _maybe_await(self.opts.page_setup(page))
 
                 wait_until = "load" if self.opts.load_dom else "domcontentloaded"
-                response: Optional[PWResponse] = page.goto(
+                response: Optional[PWResponse] = await page.goto(
                     url, wait_until=wait_until, timeout=self.opts.timeout
                 )
 
                 if self.opts.network_idle:
                     try:
-                        page.wait_for_load_state(
+                        await page.wait_for_load_state(
                             "networkidle", timeout=self.opts.timeout
                         )
                     except Exception:
                         pass
 
                 if self.opts.wait_selector:
-                    page.wait_for_selector(
+                    await page.wait_for_selector(
                         self.opts.wait_selector,
                         state=self.opts.wait_selector_state,  # type: ignore[arg-type]
                         timeout=self.opts.timeout,
                     )
 
                 if self.opts.page_action:
-                    self.opts.page_action(page)
+                    await _maybe_await(self.opts.page_action(page))
 
                 if self.opts.wait and self.opts.wait > 0:
-                    page.wait_for_timeout(int(self.opts.wait))
+                    await page.wait_for_timeout(int(self.opts.wait))
 
-                html = page.content()
-                title = page.title()
+                html = await page.content()
+                title = await page.title()
                 final_url = page.url or url
                 status = int(response.status) if response is not None else 200
-                hdrs = {}
+                hdrs: dict[str, str] = {}
                 if response is not None:
                     try:
                         hdrs = {k: v for k, v in response.headers.items()}
@@ -554,11 +521,12 @@ class DynamicSession:
                 # Merge cookies from ephemeral proxied context back into session store
                 if ephemeral:
                     try:
-                        self.set_cookies(ctx.cookies())
+                        await self.set_cookies(await ctx.cookies())
                     except Exception:
                         pass
 
                 elapsed = time.perf_counter() - started
+                cookie_count = len(await self.get_cookies())
                 return DynamicFetchResult(
                     url=final_url,
                     status_code=status,
@@ -576,18 +544,18 @@ class DynamicSession:
                         "browser": engine,
                         "engine": "playwright",
                         "headless": self.opts.headless,
-                        "cookies": len(self.get_cookies()),
+                        "cookies": cookie_count,
                         "proxy": self.last_proxy,
                     },
                 )
             finally:
                 try:
-                    page.close()
+                    await page.close()
                 except Exception:
                     pass
                 if ephemeral and ctx is not None and ctx is not self._context:
                     try:
-                        ctx.close()
+                        await ctx.close()
                     except Exception:
                         pass
         except Exception as exc:
@@ -602,31 +570,31 @@ class DynamicSession:
         finally:
             self.opts = saved
             if owns_runtime:
-                self.close()
+                await self.close()
 
     @property
     def proxy_rotator(self) -> Any:
         return self._proxy_rotator
 
-    def get_cookies(self) -> list[dict[str, Any]]:
+    async def get_cookies(self) -> list[dict[str, Any]]:
         if self._context is None:
             return []
         try:
-            return [dict(c) for c in self._context.cookies()]
+            return [dict(c) for c in await self._context.cookies()]
         except Exception:
             return []
 
-    def cookies_map(self) -> dict[str, str]:
+    async def cookies_map(self) -> dict[str, str]:
         from session_store import cookies_to_dict
 
-        return cookies_to_dict(self.get_cookies())
+        return cookies_to_dict(await self.get_cookies())
 
-    def cookies_header(self) -> str:
+    async def cookies_header(self) -> str:
         from session_store import cookies_to_header
 
-        return cookies_to_header(self.get_cookies())
+        return cookies_to_header(await self.get_cookies())
 
-    def set_cookies(self, cookies: CookieInput, url: str = "") -> None:
+    async def set_cookies(self, cookies: CookieInput, url: str = "") -> None:
         if self._context is None:
             self.opts.cookies = cookies
             return
@@ -634,84 +602,88 @@ class DynamicSession:
 
         items = normalize_cookies(cookies, url=url or "https://example.com")
         if items:
-            self._context.add_cookies(items)
+            await self._context.add_cookies(items)
 
-    def clear_cookies(self) -> None:
+    async def clear_cookies(self) -> None:
         if self._context is not None:
             try:
-                self._context.clear_cookies()
+                await self._context.clear_cookies()
             except Exception:
                 pass
 
-    def save(self, path: Optional[Union[str, Path]] = None, **meta: Any) -> Path:
+    async def save(
+        self, path: Optional[Union[str, Path]] = None, **meta: Any
+    ) -> Path:
         from session_store import save_session_file
 
         target = Path(path) if path else self._session_file
         if target is None:
             raise ValueError("No path given and no session_file configured")
-        return save_session_file(
-            target,
-            cookies=self.get_cookies(),
-            state=self.state,
-            meta={"kind": "DynamicSession", "browser": self._browser_engine, **meta},
-        )
+        cookies = await self.get_cookies()
+        state = self.state
+        engine = self._browser_engine
 
-    def load(self, path: Optional[Union[str, Path]] = None, *, url: str = "") -> None:
+        def _write() -> Path:
+            return save_session_file(
+                target,
+                cookies=cookies,
+                state=state,
+                meta={"kind": "AsyncDynamicSession", "browser": engine, **meta},
+            )
+
+        return await asyncio.to_thread(_write)
+
+    async def load(
+        self, path: Optional[Union[str, Path]] = None, *, url: str = ""
+    ) -> None:
         from session_store import load_session_file
 
         target = Path(path) if path else self._session_file
         if target is None or not Path(target).is_file():
             raise FileNotFoundError(f"Session file not found: {target}")
-        data = load_session_file(target)
+
+        data = await asyncio.to_thread(load_session_file, target)
         self.state.update(dict(data.get("state") or {}))
         if data.get("cookies"):
-            self.set_cookies(data["cookies"], url=url)
+            await self.set_cookies(data["cookies"], url=url)
 
-    def snapshot(self) -> dict[str, Any]:
+    async def snapshot(self) -> dict[str, Any]:
+        """Return cookies + state (mirrors sync ``snapshot``, async for cookies)."""
         return {
-            "cookies": self.get_cookies(),
+            "cookies": await self.get_cookies(),
             "state": dict(self.state),
-            "kind": "DynamicSession",
+            "kind": "AsyncDynamicSession",
         }
 
-    def restore(self, snapshot: Mapping[str, Any], *, url: str = "") -> None:
+    async def restore(
+        self, snapshot: Mapping[str, Any], *, url: str = ""
+    ) -> None:
         if snapshot.get("state"):
             self.state.update(dict(snapshot["state"]))
         if snapshot.get("cookies"):
-            self.set_cookies(snapshot["cookies"], url=url)  # type: ignore[arg-type]
+            await self.set_cookies(snapshot["cookies"], url=url)  # type: ignore[arg-type]
 
 
-def _overrides_to_opts(overrides: dict[str, Any]) -> dict[str, Any]:
-    """Map public kwargs into ``_SessionOptions`` field names."""
-    out = dict(overrides)
-    if "real_chrome" in out or "use_chrome" in out:
-        out["real_chrome"] = _as_bool_chrome(out)
-    allowed = {f.name for f in _SessionOptions.__dataclass_fields__.values()}  # type: ignore[attr-defined]
-    return {k: v for k, v in out.items() if k in allowed}
-
-
-def field_replace(opts: _SessionOptions, **changes: Any) -> _SessionOptions:
-    data = {f.name: getattr(opts, f.name) for f in opts.__dataclass_fields__.values()}  # type: ignore[attr-defined]
-    data.update(changes)
-    return _SessionOptions(**data)
-
-
-class DynamicFetcher:
-    """Fetch JS-rendered pages with Playwright Chromium or Google Chrome.
+class AsyncDynamicFetcher:
+    """Fetch JS-rendered pages with async Playwright Chromium or Google Chrome.
 
     Example::
 
-        from dynamic_fetcher import DynamicFetcher
+        import asyncio
+        from async_dynamic_fetcher import AsyncDynamicFetcher
 
-        r = DynamicFetcher.fetch(
-            "https://spa.example.com",
-            real_chrome=True,   # system Google Chrome; False → bundled Chromium
-            headless=True,
-            network_idle=True,
-            wait=1500,
-            wait_selector="main",
-        )
-        print(r.title, r.status_code, len(r.text))
+        async def main() -> None:
+            r = await AsyncDynamicFetcher.fetch(
+                "https://spa.example.com",
+                real_chrome=True,
+                headless=True,
+                network_idle=True,
+                wait=1500,
+                wait_selector="main",
+            )
+            print(r.title, r.status_code, len(r.text))
+
+        asyncio.run(main())
     """
 
     _defaults: dict[str, Any] = {
@@ -729,25 +701,14 @@ class DynamicFetcher:
         cls._defaults.update(kwargs)
 
     @classmethod
-    def fetch(cls, url: str, **kwargs: Any) -> DynamicFetchResult:
+    async def fetch(cls, url: str, **kwargs: Any) -> DynamicFetchResult:
         opts = {**cls._defaults, **kwargs}
-        with DynamicSession(**opts) as session:
-            return session.fetch(url)
+        async with AsyncDynamicSession(**opts) as session:
+            return await session.fetch(url)
 
     # Scrapling alias
     get = fetch
 
 
-# Backward-compatible alias used by some Scrapling docs
-PlayWrightFetcher = DynamicFetcher
-
-
-async def _dynamic_async_fetch(cls, url: str, **kwargs: Any) -> "DynamicFetchResult":
-    from async_dynamic_fetcher import AsyncDynamicFetcher
-
-    opts = {**cls._defaults, **kwargs}
-    return await AsyncDynamicFetcher.fetch(url, **opts)
-
-
-DynamicFetcher.async_fetch = classmethod(_dynamic_async_fetch)  # type: ignore[misc,assignment]
-DynamicFetcher.async_get = DynamicFetcher.async_fetch  # type: ignore[attr-defined]
+# Backward-compatible alias
+AsyncPlayWrightFetcher = AsyncDynamicFetcher

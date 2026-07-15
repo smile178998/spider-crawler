@@ -8,6 +8,7 @@ optional dependency is missing, so the rest of the app still works.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import random
 import urllib.error
@@ -21,12 +22,14 @@ from urllib.parse import urlparse
 
 try:
     from curl_cffi import CurlHttpVersion
+    from curl_cffi.requests import AsyncSession as CurlAsyncSession
     from curl_cffi.requests import Session as CurlSession
 
     HAS_CURL_CFFI = True
 except ImportError:  # pragma: no cover
     CurlHttpVersion = None  # type: ignore[assignment, misc]
     CurlSession = None  # type: ignore[assignment, misc]
+    CurlAsyncSession = None  # type: ignore[assignment, misc]
     HAS_CURL_CFFI = False
 
 ImpersonateType = Union[str, Sequence[str], None]
@@ -584,6 +587,19 @@ class Fetcher:
     def head(cls, url: str, **kwargs: Any) -> FetchResponse:
         return cls.request("HEAD", url, **kwargs)
 
+    @classmethod
+    async def async_request(cls, method: str, url: str, **kwargs: Any) -> FetchResponse:
+        # Constructor defaults stay on the core; only request kwargs are forwarded.
+        return await AsyncFetcher._core(**cls._defaults).request(method, url, **kwargs)
+
+    @classmethod
+    async def async_get(cls, url: str, **kwargs: Any) -> FetchResponse:
+        return await cls.async_request("GET", url, **kwargs)
+
+    @classmethod
+    async def async_post(cls, url: str, **kwargs: Any) -> FetchResponse:
+        return await cls.async_request("POST", url, **kwargs)
+
 
 class FetcherSession:
     """Persistent HTTP session — cookies and connection reuse across requests.
@@ -859,6 +875,619 @@ def fetch_bytes(
     from doh import resolve_dns_over_https
 
     resp = Fetcher.get(
+        url,
+        headers=headers,
+        proxy=proxy,
+        timeout=timeout,
+        impersonate=impersonate,
+        http3=http3,
+        stealthy_headers=True,
+        referer=referer,
+        dns_over_https=resolve_dns_over_https(dns_over_https),
+    )
+    content_type = ""
+    for key, value in resp.headers.items():
+        if key.lower() == "content-type":
+            content_type = value
+            break
+    return resp.content, content_type, resp.status_code
+
+
+# ---------------------------------------------------------------------------
+# Async HTTP — curl_cffi AsyncSession (+ urllib via asyncio.to_thread)
+# ---------------------------------------------------------------------------
+
+
+class _AsyncFetcherCore:
+    """Async counterpart of :class:`_FetcherCore`."""
+
+    def __init__(
+        self,
+        *,
+        impersonate: ImpersonateType = DEFAULT_IMPERSONATE,
+        stealthy_headers: bool = True,
+        http3: bool = False,
+        timeout: float = DEFAULT_TIMEOUT,
+        proxy: Optional[str] = None,
+        proxies: Optional[Mapping[str, str]] = None,
+        headers: Optional[Mapping[str, str]] = None,
+        retries: int = 2,
+        follow_redirects: bool = True,
+        verify: bool = True,
+        default_headers: bool = True,
+        proxy_rotator: Any = None,
+        dns_over_https: bool = False,
+    ) -> None:
+        self.impersonate = impersonate
+        self.stealthy_headers = stealthy_headers
+        self.http3 = http3
+        self.timeout = timeout
+        self.proxy = _normalize_proxy(proxy)
+        self.proxies = dict(proxies or {})
+        self.headers = dict(headers or {})
+        self.retries = max(0, int(retries))
+        self.follow_redirects = follow_redirects
+        self.verify = verify
+        self.default_headers = default_headers
+        self.proxy_rotator = proxy_rotator
+        self.dns_over_https = bool(dns_over_https)
+        self._session: Any = None
+        self._session_doh = False
+        self.last_proxy: Optional[str] = None
+
+    def _make_curl_session(self, *, dns_over_https: bool) -> Any:
+        assert HAS_CURL_CFFI and CurlAsyncSession is not None
+        if dns_over_https:
+            from doh import curl_doh_options
+
+            return CurlAsyncSession(curl_options=curl_doh_options())
+        return CurlAsyncSession()
+
+    def attach_session(self, session: Any) -> None:
+        self._session = session
+
+    async def close(self) -> None:
+        if self._session is not None:
+            try:
+                await self._session.close()
+            except Exception:
+                pass
+            self._session = None
+        self._session_doh = False
+
+    async def request(
+        self,
+        method: str,
+        url: str,
+        *,
+        params: Optional[Mapping[str, Any]] = None,
+        data: Any = None,
+        json_body: Any = None,
+        headers: Optional[Mapping[str, str]] = None,
+        cookies: Optional[Mapping[str, str]] = None,
+        impersonate: ImpersonateType = ...,  # type: ignore[assignment]
+        stealthy_headers: Optional[bool] = None,
+        http3: Optional[bool] = None,
+        timeout: Optional[float] = None,
+        proxy: Any = ...,  # type: ignore[assignment]
+        proxies: Optional[Mapping[str, str]] = None,
+        allow_redirects: Optional[bool] = None,
+        verify: Optional[bool] = None,
+        referer: Optional[str] = None,
+        dns_over_https: Optional[bool] = None,
+    ) -> FetchResponse:
+        if not url or not str(url).strip():
+            raise FetchError("URL is required")
+
+        url = str(url).strip()
+        impersonate_val = self.impersonate if impersonate is ... else impersonate
+        stealth = self.stealthy_headers if stealthy_headers is None else stealthy_headers
+        use_http3 = self.http3 if http3 is None else http3
+        timeout_val = self.timeout if timeout is None else timeout
+        use_doh = self.dns_over_https if dns_over_https is None else bool(dns_over_https)
+
+        from proxy_rotator import (
+            is_proxy_error,
+            proxy_to_curl_map,
+            proxy_to_url,
+            resolve_request_proxy,
+        )
+
+        if proxy is not ...:
+            chosen: Any = proxy
+            use_rotator = False
+        else:
+            chosen = resolve_request_proxy(
+                request_proxy=None,
+                proxy_rotator=self.proxy_rotator if proxies is None else None,
+                session_proxy=self.proxy,
+            )
+            use_rotator = self.proxy_rotator is not None and proxies is None
+
+        if proxies is not None:
+            proxies_val = dict(proxies)
+            proxy_val = proxies_val.get("https") or proxies_val.get("http")
+        elif chosen is not None and chosen != "":
+            proxies_val = proxy_to_curl_map(chosen) or {}
+            proxy_val = proxy_to_url(chosen)
+        elif self.proxies and proxy is ...:
+            proxies_val = dict(self.proxies)
+            proxy_val = proxies_val.get("https") or proxies_val.get("http")
+        else:
+            proxies_val = {}
+            proxy_val = None
+
+        self.last_proxy = proxy_val
+        redirects = self.follow_redirects if allow_redirects is None else allow_redirects
+        verify_val = self.verify if verify is None else verify
+
+        browser = _pick_impersonate(impersonate_val)
+        merged = build_stealth_headers(
+            url,
+            {**self.headers, **dict(headers or {})},
+            stealthy_headers=bool(stealth),
+            impersonate_enabled=bool(browser) and HAS_CURL_CFFI,
+            referer=referer,
+        )
+
+        last_err: Optional[BaseException] = None
+        attempts = self.retries + 1
+        for attempt in range(attempts):
+            try:
+                if HAS_CURL_CFFI:
+                    return await self._curl_request(
+                        method,
+                        url,
+                        params=params,
+                        data=data,
+                        json_body=json_body,
+                        headers=merged,
+                        cookies=cookies,
+                        impersonate=browser,
+                        http3=bool(use_http3),
+                        timeout=float(timeout_val),
+                        proxies=proxies_val or None,
+                        allow_redirects=bool(redirects),
+                        verify=bool(verify_val),
+                        dns_over_https=use_doh,
+                    )
+                body: Optional[bytes] = None
+                if json_body is not None:
+                    body = json.dumps(json_body).encode("utf-8")
+                    if "content-type" not in _header_keys(merged):
+                        merged = {**merged, "Content-Type": "application/json"}
+                elif data is not None:
+                    if isinstance(data, bytes):
+                        body = data
+                    elif isinstance(data, str):
+                        body = data.encode("utf-8")
+                    else:
+                        body = str(data).encode("utf-8")
+                req_url = url
+                if params:
+                    from urllib.parse import urlencode
+
+                    qs = urlencode({k: v for k, v in params.items()})
+                    req_url = f"{url}{'&' if '?' in url else '?'}{qs}"
+                return await asyncio.to_thread(
+                    _urllib_request,
+                    method,
+                    req_url,
+                    headers=merged,
+                    data=body,
+                    timeout=float(timeout_val),
+                    proxy=proxy_val,
+                    allow_redirects=bool(redirects),
+                    dns_over_https=use_doh,
+                )
+            except Exception as exc:
+                last_err = exc
+                if use_rotator and chosen is not None and is_proxy_error(exc):
+                    try:
+                        self.proxy_rotator.mark_failed(chosen)
+                    except Exception:
+                        pass
+                    chosen = self.proxy_rotator.get_proxy()
+                    proxies_val = proxy_to_curl_map(chosen) or {}
+                    proxy_val = proxy_to_url(chosen)
+                    self.last_proxy = proxy_val
+                if use_http3 and HAS_CURL_CFFI and attempt + 1 < attempts:
+                    use_http3 = False
+                    continue
+                if attempt + 1 >= attempts:
+                    break
+        raise FetchError(f"{method.upper()} {url} failed: {last_err}") from last_err
+
+    async def _curl_request(
+        self,
+        method: str,
+        url: str,
+        *,
+        params: Optional[Mapping[str, Any]],
+        data: Any,
+        json_body: Any,
+        headers: Mapping[str, str],
+        cookies: Optional[Mapping[str, str]],
+        impersonate: Optional[str],
+        http3: bool,
+        timeout: float,
+        proxies: Optional[Mapping[str, str]],
+        allow_redirects: bool,
+        verify: bool,
+        dns_over_https: bool = False,
+    ) -> FetchResponse:
+        assert HAS_CURL_CFFI and CurlAsyncSession is not None
+
+        kwargs: dict[str, Any] = {
+            "params": params,
+            "headers": dict(headers),
+            "cookies": cookies,
+            "timeout": timeout,
+            "proxies": proxies,
+            "allow_redirects": allow_redirects,
+            "verify": verify,
+            "default_headers": self.default_headers,
+        }
+        if impersonate:
+            kwargs["impersonate"] = impersonate
+        if http3 and CurlHttpVersion is not None:
+            kwargs["http_version"] = CurlHttpVersion.V3ONLY
+        if json_body is not None:
+            kwargs["json"] = json_body
+        elif data is not None:
+            kwargs["data"] = data
+
+        kwargs = {k: v for k, v in kwargs.items() if v is not None}
+
+        client = self._session
+        owns_client = False
+        if client is None or bool(self._session_doh) != bool(dns_over_https):
+            client = self._make_curl_session(dns_over_https=dns_over_https)
+            owns_client = True
+        try:
+            resp = await client.request(method.upper(), url, **kwargs)
+            return _response_from_curl(resp)
+        finally:
+            if owns_client:
+                await client.close()
+
+
+class AsyncFetcher:
+    """Async stealth HTTP client (TLS fingerprint + headers + optional HTTP/3).
+
+    Example::
+
+        import asyncio
+        from fetcher import AsyncFetcher
+
+        async def main():
+            r = await AsyncFetcher.get("https://example.com", stealthy_headers=True)
+            print(r.status_code, r.text[:200])
+
+        asyncio.run(main())
+    """
+
+    _defaults: dict[str, Any] = {
+        "impersonate": DEFAULT_IMPERSONATE,
+        "stealthy_headers": True,
+        "http3": False,
+        "timeout": DEFAULT_TIMEOUT,
+        "retries": 2,
+        "dns_over_https": False,
+    }
+
+    @classmethod
+    def configure(cls, **kwargs: Any) -> None:
+        cls._defaults.update(kwargs)
+
+    @classmethod
+    def backend(cls) -> str:
+        return Fetcher.backend()
+
+    @classmethod
+    def supports_tls_impersonation(cls) -> bool:
+        return Fetcher.supports_tls_impersonation()
+
+    @classmethod
+    def supports_http3(cls) -> bool:
+        return Fetcher.supports_http3()
+
+    @classmethod
+    def _core(cls, **overrides: Any) -> _AsyncFetcherCore:
+        opts = {**cls._defaults, **overrides}
+        return _AsyncFetcherCore(**opts)
+
+    @classmethod
+    async def request(cls, method: str, url: str, **kwargs: Any) -> FetchResponse:
+        return await cls._core().request(method, url, **kwargs)
+
+    @classmethod
+    async def get(cls, url: str, **kwargs: Any) -> FetchResponse:
+        return await cls.request("GET", url, **kwargs)
+
+    @classmethod
+    async def post(cls, url: str, **kwargs: Any) -> FetchResponse:
+        return await cls.request("POST", url, **kwargs)
+
+    @classmethod
+    async def put(cls, url: str, **kwargs: Any) -> FetchResponse:
+        return await cls.request("PUT", url, **kwargs)
+
+    @classmethod
+    async def delete(cls, url: str, **kwargs: Any) -> FetchResponse:
+        return await cls.request("DELETE", url, **kwargs)
+
+    @classmethod
+    async def head(cls, url: str, **kwargs: Any) -> FetchResponse:
+        return await cls.request("HEAD", url, **kwargs)
+
+
+class AsyncFetcherSession:
+    """Async persistent HTTP session — cookies + connection reuse.
+
+    Example::
+
+        async with AsyncFetcherSession(session_file=\".sessions/http.json\") as s:
+            await s.get(\"https://example.com/login\")
+            s.state[\"user\"] = \"alice\"
+            await s.post(\"https://example.com/api\", json_body={\"q\": 1})
+            await s.save()
+    """
+
+    def __init__(
+        self,
+        *,
+        impersonate: ImpersonateType = DEFAULT_IMPERSONATE,
+        stealthy_headers: bool = True,
+        http3: bool = False,
+        timeout: float = DEFAULT_TIMEOUT,
+        proxy: Optional[str] = None,
+        proxies: Optional[Mapping[str, str]] = None,
+        headers: Optional[Mapping[str, str]] = None,
+        retries: int = 2,
+        follow_redirects: bool = True,
+        verify: bool = True,
+        cookies: Any = None,
+        session_file: Optional[Union[str, Path]] = None,
+        state: Optional[Mapping[str, Any]] = None,
+        proxy_rotator: Any = None,
+        dns_over_https: bool = False,
+    ) -> None:
+        from session_store import load_session_file, normalize_cookies
+
+        self._core = _AsyncFetcherCore(
+            impersonate=impersonate,
+            stealthy_headers=stealthy_headers,
+            http3=http3,
+            timeout=timeout,
+            proxy=proxy,
+            proxies=proxies,
+            headers=headers,
+            retries=retries,
+            follow_redirects=follow_redirects,
+            verify=verify,
+            proxy_rotator=proxy_rotator,
+            dns_over_https=dns_over_https,
+        )
+        self._entered = False
+        self._cookie_jar = CookieJar()
+        self._seed_cookies = cookies
+        self.state: dict[str, Any] = dict(state or {})
+        self._session_file = Path(session_file) if session_file else None
+        self._normalize_cookies = normalize_cookies
+
+        if self._session_file and self._session_file.is_file():
+            data = load_session_file(self._session_file)
+            self.state.update(dict(data.get("state") or {}))
+            if data.get("cookies") and not self._seed_cookies:
+                self._seed_cookies = data["cookies"]
+
+    async def __aenter__(self) -> "AsyncFetcherSession":
+        if self._entered:
+            raise RuntimeError("AsyncFetcherSession already entered")
+        if HAS_CURL_CFFI and CurlAsyncSession is not None:
+            session = self._core._make_curl_session(
+                dns_over_https=self._core.dns_over_https
+            )
+            self._core.attach_session(session)
+            self._core._session_doh = self._core.dns_over_https
+        self._entered = True
+        if self._seed_cookies:
+            await self.set_cookies(self._seed_cookies)
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        if self._session_file:
+            try:
+                await self.save()
+            except Exception:
+                pass
+        await self.close()
+
+    async def _ensure_open(self) -> None:
+        if not self._entered:
+            await self.__aenter__()
+
+    async def request(self, method: str, url: str, **kwargs: Any) -> FetchResponse:
+        await self._ensure_open()
+        if "cookies" not in kwargs:
+            jar_map = self.cookies_map()
+            if jar_map:
+                kwargs["cookies"] = jar_map
+        return await self._core.request(method, url, **kwargs)
+
+    @property
+    def last_proxy(self) -> Optional[str]:
+        return self._core.last_proxy
+
+    @property
+    def proxy_rotator(self) -> Any:
+        return self._core.proxy_rotator
+
+    async def get(self, url: str, **kwargs: Any) -> FetchResponse:
+        return await self.request("GET", url, **kwargs)
+
+    async def post(self, url: str, **kwargs: Any) -> FetchResponse:
+        return await self.request("POST", url, **kwargs)
+
+    async def put(self, url: str, **kwargs: Any) -> FetchResponse:
+        return await self.request("PUT", url, **kwargs)
+
+    async def delete(self, url: str, **kwargs: Any) -> FetchResponse:
+        return await self.request("DELETE", url, **kwargs)
+
+    async def head(self, url: str, **kwargs: Any) -> FetchResponse:
+        return await self.request("HEAD", url, **kwargs)
+
+    async def close(self) -> None:
+        await self._core.close()
+        self._entered = False
+
+    def get_cookies(self) -> list[dict[str, Any]]:
+        session = self._core._session
+        if session is not None and hasattr(session, "cookies"):
+            try:
+                jar = session.cookies
+                items: list[dict[str, Any]] = []
+                if hasattr(jar, "get_dict"):
+                    for name, value in jar.get_dict().items():
+                        items.append({"name": str(name), "value": str(value), "path": "/"})
+                elif hasattr(jar, "items"):
+                    for name, value in dict(jar).items():
+                        items.append({"name": str(name), "value": str(value), "path": "/"})
+                if items:
+                    return items
+            except Exception:
+                pass
+        items = []
+        for c in self._cookie_jar:
+            items.append(
+                {
+                    "name": c.name,
+                    "value": c.value,
+                    "domain": c.domain,
+                    "path": c.path or "/",
+                }
+            )
+        return items
+
+    def cookies_map(self) -> dict[str, str]:
+        from session_store import cookies_to_dict
+
+        return cookies_to_dict(self.get_cookies())
+
+    def cookies_header(self) -> str:
+        from session_store import cookies_to_header
+
+        return cookies_to_header(self.get_cookies())
+
+    async def set_cookies(self, cookies: Any, url: str = "") -> None:
+        items = self._normalize_cookies(cookies, url=url)
+        await self._ensure_open()
+        session = self._core._session
+        if session is not None and hasattr(session, "cookies"):
+            for c in items:
+                try:
+                    session.cookies.set(c["name"], c.get("value", ""))
+                except Exception:
+                    try:
+                        session.cookies[c["name"]] = c.get("value", "")
+                    except Exception:
+                        pass
+        for c in items:
+            domain = (
+                c.get("domain")
+                or urlparse(url or "https://example.com").hostname
+                or "example.com"
+            )
+            cookie = Cookie(
+                version=0,
+                name=c["name"],
+                value=str(c.get("value", "")),
+                port=None,
+                port_specified=False,
+                domain=domain,
+                domain_specified=True,
+                domain_initial_dot=str(domain).startswith("."),
+                path=c.get("path") or "/",
+                path_specified=True,
+                secure=bool(c.get("secure", False)),
+                expires=None,
+                discard=True,
+                comment=None,
+                comment_url=None,
+                rest={},
+                rfc2109=False,
+            )
+            try:
+                self._cookie_jar.set_cookie(cookie)
+            except Exception:
+                pass
+
+    async def clear_cookies(self) -> None:
+        session = self._core._session
+        if session is not None and hasattr(session, "cookies"):
+            try:
+                session.cookies.clear()
+            except Exception:
+                pass
+        self._cookie_jar = CookieJar()
+
+    async def save(self, path: Optional[Union[str, Path]] = None, **meta: Any) -> Path:
+        from session_store import save_session_file
+
+        target = Path(path) if path else self._session_file
+        if target is None:
+            raise ValueError("No path given and no session_file configured")
+        cookies = self.get_cookies()
+        state = self.state
+        kind_meta = {"kind": "AsyncFetcherSession", **meta}
+        return await asyncio.to_thread(
+            lambda: save_session_file(
+                target, cookies=cookies, state=state, meta=kind_meta
+            )
+        )
+
+    async def load(self, path: Optional[Union[str, Path]] = None, *, url: str = "") -> None:
+        from session_store import load_session_file
+
+        target = Path(path) if path else self._session_file
+        if target is None or not Path(target).is_file():
+            raise FileNotFoundError(f"Session file not found: {target}")
+        data = await asyncio.to_thread(load_session_file, target)
+        self.state.update(dict(data.get("state") or {}))
+        if data.get("cookies"):
+            await self.set_cookies(data["cookies"], url=url)
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "cookies": self.get_cookies(),
+            "state": dict(self.state),
+            "kind": "AsyncFetcherSession",
+        }
+
+    async def restore(self, snapshot: Mapping[str, Any], *, url: str = "") -> None:
+        if snapshot.get("state"):
+            self.state.update(dict(snapshot["state"]))
+        if snapshot.get("cookies"):
+            await self.set_cookies(snapshot["cookies"], url=url)
+
+
+async def async_fetch_bytes(
+    url: str,
+    *,
+    headers: Optional[Mapping[str, str]] = None,
+    proxy: Optional[str] = None,
+    timeout: float = 120.0,
+    impersonate: ImpersonateType = DEFAULT_IMPERSONATE,
+    http3: bool = False,
+    referer: Optional[str] = None,
+    dns_over_https: Optional[bool] = None,
+) -> tuple[bytes, str, int]:
+    """Async binary download helper. Returns ``(content, content_type, status_code)``."""
+    from doh import resolve_dns_over_https
+
+    resp = await AsyncFetcher.get(
         url,
         headers=headers,
         proxy=proxy,

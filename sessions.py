@@ -2,13 +2,13 @@
 # -*- coding: utf-8 -*-
 """Unified session exports — persistent cookies & state across requests.
 
-Three tiers share the same cookie/state API:
+Three sync tiers + matching async sessions share the cookie/state API:
 
-* :class:`~fetcher.FetcherSession` — stealth HTTP (curl_cffi)
-* :class:`~dynamic_fetcher.DynamicSession` — Playwright browser
-* :class:`~stealthy_fetcher.StealthySession` — Patchright/Playwright + CF
+* :class:`~fetcher.FetcherSession` / :class:`~fetcher.AsyncFetcherSession`
+* :class:`~dynamic_fetcher.DynamicSession` / :class:`~async_dynamic_fetcher.AsyncDynamicSession`
+* :class:`~stealthy_fetcher.StealthySession` / :class:`~async_stealthy_fetcher.AsyncStealthySession`
 
-Common methods on every session::
+Common methods on every session (async variants are ``await``-able where I/O)::
 
     get_cookies() / set_cookies() / clear_cookies()
     cookies_map() / cookies_header()
@@ -19,9 +19,11 @@ Common methods on every session::
 
 from __future__ import annotations
 
-from fetcher import FetcherSession
+from fetcher import AsyncFetcherSession, FetcherSession
 from dynamic_fetcher import DynamicSession
 from stealthy_fetcher import StealthySession
+from async_dynamic_fetcher import AsyncDynamicSession
+from async_stealthy_fetcher import AsyncStealthySession
 from session_store import (
     CookieInput,
     cookies_to_dict,
@@ -58,8 +60,11 @@ from doh import (
 
 __all__ = [
     "FetcherSession",
+    "AsyncFetcherSession",
     "DynamicSession",
+    "AsyncDynamicSession",
     "StealthySession",
+    "AsyncStealthySession",
     "CookieInput",
     "cookies_to_dict",
     "cookies_to_header",

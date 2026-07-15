@@ -1,52 +1,74 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""StealthyFetcher — advanced anti-bot browser fetch with fingerprint spoofing.
+"""AsyncStealthyFetcher — async twin of StealthySession / StealthyFetcher.
 
-Tier-3 counterpart to ``Fetcher`` (HTTP) and ``DynamicFetcher`` (Playwright):
+Prefer **patchright.async_api** when installed; else Playwright async API.
+Fingerprint spoofing and Cloudflare Turnstile / interstitial solving mirror
+the sync implementation in ``stealthy_fetcher``.
 
-* Prefer **patchright** (stealth Chromium fork) when installed; else Playwright
-* Fingerprint controls: canvas noise, WebRTC IP leak block, WebGL toggle
-* ``solve_cloudflare=True`` — detect & clear Cloudflare Turnstile / interstitial
-  challenges (managed / interactive / non-interactive / embedded), Scrapling-style
+Example::
 
-This does **not** cryptographically crack CAPTCHAs. It presents a more realistic
-browser environment and automates the UI flow so challenges can pass on their own.
+    import asyncio
+    from async_stealthy_fetcher import AsyncStealthyFetcher
+
+    async def main():
+        r = await AsyncStealthyFetcher.fetch(
+            "https://protected.example",
+            solve_cloudflare=True,
+            hide_canvas=True,
+            block_webrtc=True,
+            real_chrome=True,
+            headless=True,
+            timeout=60000,
+        )
+        print(r.title, r.extras.get("cloudflare_solved"))
+
+    asyncio.run(main())
 """
 
 from __future__ import annotations
 
+import inspect
 import random
-import re
 import tempfile
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Sequence, Union
+from urllib.parse import urlparse
 
 from fetcher import FetchError
 from dynamic_fetcher import (
     DynamicFetchResult,
-    PageAction,
     CookieInput,
     ProxyInput,
     _as_bool_chrome,
     _normalize_proxy,
     _pick_profile,
 )
+from stealthy_fetcher import (
+    detect_cloudflare_challenge,
+    _fingerprint_init_script,
+    CF_FRAME_RE,
+    DEFAULT_TIMEOUT_MS,
+    DEFAULT_WAIT_MS,
+    STEALTH_LAUNCH_FLAGS,
+    _StealthOptions,
+    HAS_PATCHRIGHT,
+)
 
-# Prefer patchright (drops many Playwright CDP / automation leaks).
+# Prefer patchright async (drops many Playwright CDP / automation leaks).
 try:
-    from patchright.sync_api import sync_playwright as _sync_playwright
+    from patchright.async_api import async_playwright as _async_playwright
 
-    HAS_PATCHRIGHT = True
+    HAS_PATCHRIGHT_ASYNC = True
     ENGINE_NAME = "patchright"
 except ImportError:
-    from playwright.sync_api import sync_playwright as _sync_playwright
+    from playwright.async_api import async_playwright as _async_playwright
 
-    HAS_PATCHRIGHT = False
+    HAS_PATCHRIGHT_ASYNC = False
     ENGINE_NAME = "playwright"
 
-from playwright.sync_api import Browser, BrowserContext, Page, Playwright, Response as PWResponse
+from playwright.async_api import Browser, BrowserContext, Page, Playwright, Response as PWResponse
 
 try:
     from playwright_stealth import Stealth
@@ -60,173 +82,23 @@ from scraper_core import (  # noqa: E402
     BROWSER_ARGS,
     _build_headers,
     _is_challenge_page,
-    _simulate_human,
+    _simulate_human_async,
     _stealth_init_script,
 )
 
-CF_FRAME_RE = re.compile(
-    r"^https?://challenges\.cloudflare\.com/cdn-cgi/challenge-platform/.*"
-)
-TURNSTILE_SCRIPT_RE = re.compile(
-    r'challenges\.cloudflare\.com/turnstile/v', re.I
-)
-
-DEFAULT_TIMEOUT_MS = 60_000  # CF solver needs longer waits
-DEFAULT_WAIT_MS = 0
-
-STEALTH_LAUNCH_FLAGS = (
-    "--disable-blink-features=AutomationControlled",
-    "--disable-infobars",
-    "--no-first-run",
-    "--no-default-browser-check",
-    "--disable-background-timer-throttling",
-    "--disable-backgrounding-occluded-windows",
-    "--disable-renderer-backgrounding",
-    "--disable-dev-shm-usage",
-    "--disable-features=IsolateOrigins,site-per-process",
-    "--lang=en-US",
-)
+PageAction = Callable[[Page], Any]
 
 
-def _fingerprint_init_script(
-    *,
-    languages: list[str],
-    navigator_platform: str,
-    hide_canvas: bool,
-    block_webrtc: bool,
-    allow_webgl: bool,
-) -> str:
-    """Stronger init patches on top of the base stealth script."""
-    base = _stealth_init_script(languages, navigator_platform)
-    extras: list[str] = []
-
-    if hide_canvas:
-        extras.append(
-            """
-(() => {
-  const noise = () => (Math.random() * 0.0001) - 0.00005;
-  const patch = (proto, method) => {
-    const orig = proto[method];
-    if (!orig) return;
-    proto[method] = function(...args) {
-      const result = orig.apply(this, args);
-      if (result && result.data && result.data.length) {
-        try {
-          for (let i = 0; i < Math.min(48, result.data.length); i += 4) {
-            result.data[i] = Math.max(0, Math.min(255, result.data[i] + (Math.random() < 0.08 ? 1 : 0)));
-          }
-        } catch (_) {}
-      }
-      return result;
-    };
-  };
-  patch(CanvasRenderingContext2D.prototype, 'getImageData');
-  const toDataURL = HTMLCanvasElement.prototype.toDataURL;
-  HTMLCanvasElement.prototype.toDataURL = function(...args) {
-    try {
-      const ctx = this.getContext('2d');
-      if (ctx) {
-        const w = Math.min(this.width || 0, 16);
-        const h = Math.min(this.height || 0, 16);
-        if (w && h) {
-          const img = ctx.getImageData(0, 0, w, h);
-          for (let i = 0; i < img.data.length; i += 4) {
-            img.data[i] ^= (Math.random() < 0.02 ? 1 : 0);
-          }
-          ctx.putImageData(img, 0, 0);
-        }
-      }
-    } catch (_) {}
-    return toDataURL.apply(this, args);
-  };
-})();
-"""
-        )
-
-    if block_webrtc:
-        extras.append(
-            """
-(() => {
-  const noop = () => {};
-  const FakePC = function() {
-    this.createDataChannel = () => ({ close: noop, send: noop });
-    this.createOffer = () => Promise.reject(new Error('WebRTC blocked'));
-    this.setLocalDescription = () => Promise.resolve();
-    this.close = noop;
-    this.onicecandidate = null;
-  };
-  try { window.RTCPeerConnection = FakePC; } catch (_) {}
-  try { window.webkitRTCPeerConnection = FakePC; } catch (_) {}
-  try {
-    Object.defineProperty(navigator, 'mediaDevices', {
-      get: () => ({
-        enumerateDevices: async () => [],
-        getUserMedia: async () => { throw new Error('Permission denied'); },
-      }),
-    });
-  } catch (_) {}
-})();
-"""
-        )
-
-    if not allow_webgl:
-        extras.append(
-            """
-(() => {
-  const block = function() { return null; };
-  HTMLCanvasElement.prototype.getContext = new Proxy(HTMLCanvasElement.prototype.getContext, {
-    apply(target, thisArg, args) {
-      if (args[0] === 'webgl' || args[0] === 'webgl2' || args[0] === 'experimental-webgl') {
-        return null;
-      }
-      return Reflect.apply(target, thisArg, args);
-    },
-  });
-})();
-"""
-        )
-    else:
-        # Keep WebGL on but stabilize vendor/renderer (common WAF check).
-        extras.append(
-            """
-(() => {
-  const patchParam = (proto) => {
-    if (!proto || !proto.getParameter) return;
-    const orig = proto.getParameter;
-    proto.getParameter = function(param) {
-      if (param === 37445) return 'Intel Inc.';
-      if (param === 37446) return 'Intel Iris OpenGL Engine';
-      return orig.call(this, param);
-    };
-  };
-  try { patchParam(WebGLRenderingContext.prototype); } catch (_) {}
-  try { patchParam(WebGL2RenderingContext.prototype); } catch (_) {}
-})();
-"""
-        )
-
-    return base + "\n" + "\n".join(extras)
+async def _maybe_await(value: Any) -> Any:
+    if inspect.isawaitable(value):
+        return await value
+    return value
 
 
-def detect_cloudflare_challenge(html: str) -> Optional[str]:
-    """Return challenge kind: non-interactive | managed | interactive | embedded."""
-    for ctype in ("non-interactive", "managed", "interactive"):
-        if f"cType: '{ctype}'" in html:
-            return ctype
-    if TURNSTILE_SCRIPT_RE.search(html) or "cf-turnstile" in html.lower():
-        return "embedded"
-    lower = html.lower()
-    if "just a moment" in lower or "cf-browser-verification" in lower:
-        return "managed"
-    if any(h in lower for h in ("cf-turnstile", "challenge-platform", "turnstile")):
-        return "embedded"
-    return None
-
-
-def _page_has_cf_challenge(page: Page) -> bool:
+async def _page_has_cf_challenge_async(page: Page) -> bool:
     try:
-        html = page.content()
-        title = page.title()
+        html = await page.content()
+        title = await page.title()
     except Exception:
         return False
     if detect_cloudflare_challenge(html):
@@ -234,14 +106,14 @@ def _page_has_cf_challenge(page: Page) -> bool:
     return _is_challenge_page(html, title)
 
 
-def _wait_networkidle(page: Page, timeout: int = 5000) -> None:
+async def _wait_networkidle_async(page: Any, timeout: int = 5000) -> None:
     try:
-        page.wait_for_load_state("networkidle", timeout=timeout)
+        await page.wait_for_load_state("networkidle", timeout=timeout)
     except Exception:
         pass
 
 
-def solve_cloudflare_challenge(
+async def solve_cloudflare_challenge_async(
     page: Page,
     *,
     timeout_ms: int = 60_000,
@@ -260,18 +132,26 @@ def solve_cloudflare_challenge(
         if time.time() > deadline:
             break
 
-        _wait_networkidle(page, timeout=5000)
+        await _wait_networkidle_async(page, timeout=5000)
         try:
-            html = page.content()
+            html = await page.content()
         except Exception:
             html = ""
 
         challenge_type = detect_cloudflare_challenge(html)
-        if not challenge_type and not _is_challenge_page(html, page.title()):
+        title = ""
+        try:
+            title = await page.title()
+        except Exception:
+            pass
+        if not challenge_type and not _is_challenge_page(html, title):
             _log("[Stealthy] No Cloudflare challenge detected.")
             return True
 
-        _log(f"[Stealthy] Cloudflare challenge type={challenge_type or 'generic'} (round {round_idx + 1})")
+        _log(
+            f"[Stealthy] Cloudflare challenge type={challenge_type or 'generic'} "
+            f"(round {round_idx + 1})"
+        )
 
         # Non-interactive: wait for "Just a moment..." to vanish
         if challenge_type == "non-interactive" or (
@@ -280,41 +160,42 @@ def solve_cloudflare_challenge(
             waited = 0
             while time.time() < deadline and waited < 45:
                 try:
-                    content = page.content()
-                    title = page.title().lower()
+                    content = await page.content()
+                    title_l = (await page.title()).lower()
                 except Exception:
                     break
-                if "just a moment" not in content.lower() and "just a moment" not in title:
-                    if not _page_has_cf_challenge(page):
+                if "just a moment" not in content.lower() and "just a moment" not in title_l:
+                    if not await _page_has_cf_challenge_async(page):
                         _log("[Stealthy] Non-interactive challenge cleared.")
                         return True
                     break
-                page.wait_for_timeout(1000)
+                await page.wait_for_timeout(1000)
                 waited += 1
                 if random.random() < 0.35:
-                    _simulate_human(page, viewport)
-            if not _page_has_cf_challenge(page):
+                    await _simulate_human_async(page, viewport)
+            if not await _page_has_cf_challenge_async(page):
                 return True
 
         # Interactive / embedded: click Turnstile checkbox
-        _click_turnstile_checkbox(page, challenge_type or "embedded", _log)
+        await _click_turnstile_checkbox_async(page, challenge_type or "embedded", _log)
 
         # Poll for clearance
         poll = 0
         while time.time() < deadline and poll < 100:
-            page.wait_for_timeout(100)
+            await page.wait_for_timeout(100)
             poll += 1
             try:
-                content = page.content()
-                title = page.title()
+                content = await page.content()
+                title = await page.title()
             except Exception:
                 continue
             if "just a moment" in content.lower() or "just a moment" in title.lower():
                 continue
-            if not detect_cloudflare_challenge(content) and not _is_challenge_page(content, title):
-                # Prefer seeing cf_clearance when available
+            if not detect_cloudflare_challenge(content) and not _is_challenge_page(
+                content, title
+            ):
                 try:
-                    cookies = page.context.cookies()
+                    cookies = await page.context.cookies()
                     if any(c.get("name") == "cf_clearance" for c in cookies):
                         _log("[Stealthy] cf_clearance cookie present — challenge solved.")
                         return True
@@ -323,30 +204,29 @@ def solve_cloudflare_challenge(
                 _log("[Stealthy] Challenge page cleared.")
                 return True
             if poll % 15 == 0:
-                _simulate_human(page, viewport)
+                await _simulate_human_async(page, viewport)
 
-        if not _page_has_cf_challenge(page):
+        if not await _page_has_cf_challenge_async(page):
             return True
         _log("[Stealthy] Challenge still present — retrying …")
 
-    ok = not _page_has_cf_challenge(page)
+    ok = not await _page_has_cf_challenge_async(page)
     _log("[Stealthy] Cloudflare solve finished ok=" + str(ok))
     return ok
 
 
-def _click_turnstile_checkbox(
+async def _click_turnstile_checkbox_async(
     page: Page, challenge_type: str, log: Callable[[str], None]
 ) -> None:
     """Human-like click on the Cloudflare Turnstile checkbox / iframe."""
-    # Wait for verifying spinner to leave
     for _ in range(20):
         try:
-            body = page.content()
+            body = await page.content()
         except Exception:
             break
         if "verifying you are human" not in body.lower():
             break
-        page.wait_for_timeout(500)
+        await page.wait_for_timeout(500)
 
     outer_box: Optional[dict] = None
     iframe = None
@@ -357,22 +237,22 @@ def _click_turnstile_checkbox(
 
     if iframe is not None:
         try:
-            _wait_networkidle(iframe, timeout=4000)  # type: ignore[arg-type]
+            await _wait_networkidle_async(iframe, timeout=4000)
         except Exception:
             pass
         if challenge_type != "embedded":
             for _ in range(20):
                 try:
-                    el = iframe.frame_element()
-                    if el.is_visible():
-                        outer_box = el.bounding_box()
+                    el = await iframe.frame_element()
+                    if await el.is_visible():
+                        outer_box = await el.bounding_box()
                         break
                 except Exception:
                     pass
-                page.wait_for_timeout(500)
+                await page.wait_for_timeout(500)
         else:
             try:
-                outer_box = iframe.frame_element().bounding_box()
+                outer_box = await (await iframe.frame_element()).bounding_box()
             except Exception:
                 outer_box = None
 
@@ -387,9 +267,9 @@ def _click_turnstile_checkbox(
         for sel in selectors:
             try:
                 loc = page.locator(sel).last
-                if loc.count() == 0:
+                if await loc.count() == 0:
                     continue
-                box = loc.bounding_box()
+                box = await loc.bounding_box()
                 if box:
                     outer_box = box
                     break
@@ -397,72 +277,76 @@ def _click_turnstile_checkbox(
                 continue
 
     if not outer_box:
-        # Soft human noise even if we cannot find the box yet
         vp = page.viewport_size or {"width": 1280, "height": 900}
-        _simulate_human(page, vp)
+        await _simulate_human_async(page, vp)
         log("[Stealthy] Turnstile box not found — waited with human mouse noise.")
         return
 
     x = outer_box["x"] + random.randint(26, 28)
     y = outer_box["y"] + random.randint(25, 27)
-    # Approach from a nearby point for less robotic motion
-    page.mouse.move(
+    await page.mouse.move(
         x + random.randint(-40, -10),
         y + random.randint(-30, 10),
         steps=random.randint(12, 24),
     )
-    page.wait_for_timeout(random.randint(80, 200))
-    page.mouse.click(x, y, delay=random.randint(100, 220), button="left")
+    await page.wait_for_timeout(random.randint(80, 200))
+    await page.mouse.click(x, y, delay=random.randint(100, 220), button="left")
     log(f"[Stealthy] Clicked Turnstile at ({x:.0f}, {y:.0f}).")
-    _wait_networkidle(page, timeout=8000)
+    await _wait_networkidle_async(page, timeout=8000)
 
 
-@dataclass
-class _StealthOptions:
-    headless: bool = True
-    real_chrome: bool = True
-    solve_cloudflare: bool = True
-    hide_canvas: bool = True
-    block_webrtc: bool = True
-    allow_webgl: bool = True
-    disable_resources: bool = False
-    blocked_domains: Optional[Sequence[str]] = None
-    block_ads: bool = False
-    network_idle: bool = False
-    load_dom: bool = True
-    timeout: int = DEFAULT_TIMEOUT_MS
-    wait: int = DEFAULT_WAIT_MS
-    wait_selector: Optional[str] = None
-    wait_selector_state: str = "attached"
-    useragent: Optional[str] = None
-    cookies: CookieInput = None
-    locale: Optional[str] = None
-    timezone_id: Optional[str] = None
-    proxy: ProxyInput = None
-    google_search: bool = True
-    extra_headers: Optional[Mapping[str, str]] = None
-    extra_flags: Optional[Sequence[str]] = None
-    init_script: Optional[str] = None
-    page_action: Optional[PageAction] = None
-    page_setup: Optional[PageAction] = None
-    cdp_url: Optional[str] = None
-    additional_args: Optional[Mapping[str, Any]] = None
-    viewport: Optional[Mapping[str, int]] = None
-    user_data_dir: Optional[str] = None
-    humanize: bool = True
-    dns_over_https: bool = False
+async def _apply_request_blocking_async(
+    page: Page,
+    *,
+    disable_resources: bool = False,
+    blocked_domains: Any = None,
+    block_ads: bool = False,
+) -> bool:
+    """Async-aware route blocking (awaits ``page.route`` / abort / continue)."""
+    from request_blocking import (
+        HEAVY_RESOURCES,
+        is_domain_blocked,
+        merge_blocked_domains,
+    )
+
+    domains = merge_blocked_domains(blocked_domains, block_ads=block_ads)
+    if not disable_resources and not domains:
+        return False
+
+    async def handler(route: Any) -> None:
+        try:
+            req = route.request
+            if disable_resources and req.resource_type in HEAVY_RESOURCES:
+                await route.abort()
+                return
+            if domains:
+                hostname = urlparse(req.url).hostname or ""
+                if is_domain_blocked(hostname, domains):
+                    await route.abort()
+                    return
+            await route.continue_()
+        except Exception:
+            try:
+                await route.continue_()
+            except Exception:
+                pass
+
+    await page.route("**/*", handler)
+    return True
 
 
-class StealthySession:
-    """Persistent stealth browser session — cookies / profile / state across fetches.
+class AsyncStealthySession:
+    """Persistent stealth browser session — async cookies / profile / state.
 
     Example::
 
-        with StealthySession(session_file=".sessions/stealth.json", solve_cloudflare=True) as s:
-            s.fetch("https://protected.example/login")
+        async with AsyncStealthySession(
+            session_file=".sessions/stealth.json", solve_cloudflare=True
+        ) as s:
+            await s.fetch("https://protected.example/login")
             s.state["authed"] = True
-            s.fetch("https://protected.example/dashboard")
-            s.save()
+            await s.fetch("https://protected.example/dashboard")
+            await s.save()
     """
 
     def __init__(self, **kwargs: Any) -> None:
@@ -527,6 +411,7 @@ class StealthySession:
         self._browser_label = ""
         self._entered = False
         self._cookies_seeded = False
+        self._cookie_cache: list[dict[str, Any]] = []
         self._log: Callable[[str], None] = lambda _m: None
         self.state: dict[str, Any] = dict(state or {})
         self._session_file = Path(session_file) if session_file else None
@@ -550,45 +435,45 @@ class StealthySession:
     def set_logger(self, log: Callable[[str], None]) -> None:
         self._log = log
 
-    def __enter__(self) -> "StealthySession":
+    async def __aenter__(self) -> "AsyncStealthySession":
         if self._entered:
-            raise RuntimeError("StealthySession already entered")
-        self._pw = _sync_playwright().start()
-        self._browser, self._context, self._browser_label = self._launch(self._pw)
+            raise RuntimeError("AsyncStealthySession already entered")
+        self._pw = await _async_playwright().start()
+        self._browser, self._context, self._browser_label = await self._launch(self._pw)
         self._entered = True
         if self.opts.cookies:
-            self.set_cookies(self.opts.cookies)
+            await self.set_cookies(self.opts.cookies)
             self._cookies_seeded = True
         self._log(
             f"[Stealthy] Engine={self._engine} browser={self._browser_label} "
-            f"patchright={HAS_PATCHRIGHT}"
+            f"patchright={HAS_PATCHRIGHT_ASYNC}"
         )
         return self
 
-    def __exit__(self, exc_type, exc, tb) -> None:
+    async def __aexit__(self, exc_type, exc, tb) -> None:
         if self._session_file:
             try:
-                self.save()
+                await self.save()
             except Exception:
                 pass
-        self.close()
+        await self.close()
 
-    def close(self) -> None:
+    async def close(self) -> None:
         if self._context is not None:
             try:
-                self._context.close()
+                await self._context.close()
             except Exception:
                 pass
         self._context = None
         if self._browser is not None:
             try:
-                self._browser.close()
+                await self._browser.close()
             except Exception:
                 pass
         self._browser = None
         if self._pw is not None:
             try:
-                self._pw.stop()
+                await self._pw.stop()
             except Exception:
                 pass
         self._pw = None
@@ -607,7 +492,6 @@ class StealthySession:
 
         args = list(dict.fromkeys([*BROWSER_ARGS, *STEALTH_LAUNCH_FLAGS]))
         args = apply_chromium_doh(args, self.opts.dns_over_https)
-        # QUIC can look odd behind some proxies; keep optional — do not force disable
         if self.opts.block_webrtc:
             args.extend(
                 [
@@ -624,17 +508,18 @@ class StealthySession:
                 ]
             )
         if self.opts.hide_canvas:
-            # Supported on Chromium builds that ship fingerprinting-canvas noise
             args.append("--fingerprinting-canvas-image-data-noise")
         if self.opts.extra_flags:
             args.extend(str(f) for f in self.opts.extra_flags)
         return args
 
-    def _launch(self, pw: Playwright) -> tuple[Optional[Browser], BrowserContext, str]:
+    async def _launch(
+        self, pw: Playwright
+    ) -> tuple[Optional[Browser], BrowserContext, str]:
         opts = self.opts
         if opts.cdp_url:
-            browser = pw.chromium.connect_over_cdp(opts.cdp_url)
-            ctx = browser.contexts[0] if browser.contexts else browser.new_context()
+            browser = await pw.chromium.connect_over_cdp(opts.cdp_url)
+            ctx = browser.contexts[0] if browser.contexts else await browser.new_context()
             return browser, ctx, "cdp"
 
         profile = _pick_profile(opts.useragent, opts.locale, opts.viewport)
@@ -642,7 +527,6 @@ class StealthySession:
             profile["timezone"] = opts.timezone_id
 
         args = self._stealth_args()
-        # Static proxy at launch only when not rotating
         proxy = None
         if self._proxy_rotator is None:
             proxy = _normalize_proxy(opts.proxy)
@@ -682,31 +566,34 @@ class StealthySession:
 
         errors: list[str] = []
 
-        def try_persistent(channel: Optional[str]) -> Optional[tuple[BrowserContext, str]]:
+        async def try_persistent(
+            channel: Optional[str],
+        ) -> Optional[tuple[BrowserContext, str]]:
             kw = {**launch_kwargs, **ctx_kwargs, "user_data_dir": user_data}
             if channel:
                 kw["channel"] = channel
             try:
-                ctx = pw.chromium.launch_persistent_context(**kw)
+                ctx = await pw.chromium.launch_persistent_context(**kw)
                 label = channel or "chromium"
                 return ctx, label
             except Exception as exc:
                 errors.append(f"persistent/{channel or 'chromium'}: {exc}")
                 return None
 
-        def try_ephemeral(channel: Optional[str]) -> Optional[tuple[Browser, BrowserContext, str]]:
+        async def try_ephemeral(
+            channel: Optional[str],
+        ) -> Optional[tuple[Browser, BrowserContext, str]]:
             kw = dict(launch_kwargs)
             if channel:
                 kw["channel"] = channel
             try:
-                browser = pw.chromium.launch(**kw)
-                ctx = browser.new_context(**ctx_kwargs)
+                browser = await pw.chromium.launch(**kw)
+                ctx = await browser.new_context(**ctx_kwargs)
                 return browser, ctx, channel or "chromium"
             except Exception as exc:
                 errors.append(f"ephemeral/{channel or 'chromium'}: {exc}")
                 return None
 
-        # Prefer persistent context unless rotating (need Browser.new_context per proxy).
         order: list[Optional[str]] = []
         if opts.real_chrome:
             order.extend(["chrome", None])
@@ -715,27 +602,27 @@ class StealthySession:
 
         if self._proxy_rotator is None:
             for channel in order:
-                got = try_persistent(channel)
+                got = await try_persistent(channel)
                 if got:
                     ctx, label = got
-                    self._apply_init_scripts(ctx, profile, url_hint="https://example.com")
+                    await self._apply_init_scripts(ctx, profile, url_hint="https://example.com")
                     return None, ctx, label
 
         for channel in order:
-            got_e = try_ephemeral(channel)
+            got_e = await try_ephemeral(channel)
             if got_e:
                 browser, ctx, label = got_e
-                self._apply_init_scripts(ctx, profile, url_hint="https://example.com")
+                await self._apply_init_scripts(ctx, profile, url_hint="https://example.com")
                 return browser, ctx, label
 
         raise FetchError(
             "Unable to launch stealth browser: "
             + (" | ".join(errors) or "unknown")
             + ". Install Google Chrome or run: python -m playwright install chromium"
-            + (" (and pip install patchright)" if not HAS_PATCHRIGHT else "")
+            + (" (and pip install patchright)" if not HAS_PATCHRIGHT_ASYNC else "")
         )
 
-    def _apply_init_scripts(
+    async def _apply_init_scripts(
         self, ctx: BrowserContext, profile: dict, url_hint: str
     ) -> None:
         opts = self.opts
@@ -747,11 +634,11 @@ class StealthySession:
         if opts.extra_headers:
             headers.update({str(k): str(v) for k, v in opts.extra_headers.items()})
         try:
-            ctx.set_extra_http_headers(headers)
+            await ctx.set_extra_http_headers(headers)
         except Exception:
             pass
 
-        ctx.add_init_script(
+        await ctx.add_init_script(
             _fingerprint_init_script(
                 languages=profile["languages"],
                 navigator_platform=profile["navigator_platform"],
@@ -763,11 +650,11 @@ class StealthySession:
         if opts.init_script:
             path = Path(opts.init_script)
             if path.is_file():
-                ctx.add_init_script(path=str(path))
+                await ctx.add_init_script(path=str(path))
             else:
-                ctx.add_init_script(opts.init_script)
+                await ctx.add_init_script(opts.init_script)
 
-    def fetch(self, url: str, **overrides: Any) -> DynamicFetchResult:
+    async def fetch(self, url: str, **overrides: Any) -> DynamicFetchResult:
         if not url or not str(url).strip():
             raise FetchError("URL is required")
         url = str(url).strip()
@@ -781,7 +668,7 @@ class StealthySession:
 
         owns = False
         if not self._entered:
-            self.__enter__()
+            await self.__aenter__()
             owns = True
 
         assert self._context is not None
@@ -822,7 +709,7 @@ class StealthySession:
                 headers.update({str(k): str(v) for k, v in opts.extra_headers.items()})
             if extra_headers:
                 headers.update({str(k): str(v) for k, v in dict(extra_headers).items()})
-            ctx = self._browser.new_context(
+            ctx = await self._browser.new_context(
                 user_agent=profile["ua"],
                 viewport={
                     "width": int(profile["viewport"]["width"]),
@@ -834,34 +721,28 @@ class StealthySession:
                 extra_http_headers=headers,
                 proxy=fetch_proxy,
             )
-            self._apply_init_scripts(ctx, profile, url_hint=url)
-            existing = self.get_cookies()
+            await self._apply_init_scripts(ctx, profile, url_hint=url)
+            existing = await self.get_cookies()
             if existing:
                 try:
-                    ctx.add_cookies(existing)
+                    await ctx.add_cookies(existing)
                 except Exception:
                     pass
             ephemeral = True
 
         started = time.perf_counter()
-        page = ctx.new_page()
+        page = await ctx.new_page()
         page.set_default_timeout(opts.timeout)
 
         try:
             if HAS_STEALTH:
                 try:
-                    _stealth.apply_stealth_sync(page)
+                    await _stealth.apply_stealth_async(page)
                 except Exception:
                     pass
 
-            if (
-                opts.disable_resources
-                or opts.block_ads
-                or opts.blocked_domains
-            ):
-                from request_blocking import apply_request_blocking
-
-                apply_request_blocking(
+            if opts.disable_resources or opts.block_ads or opts.blocked_domains:
+                await _apply_request_blocking_async(
                     page,
                     disable_resources=opts.disable_resources,
                     blocked_domains=opts.blocked_domains,
@@ -869,48 +750,48 @@ class StealthySession:
                 )
 
             if extra_headers and not ephemeral:
-                page.set_extra_http_headers(
+                await page.set_extra_http_headers(
                     {str(k): str(v) for k, v in dict(extra_headers).items()}
                 )
 
             if page_setup:
-                page_setup(page)
+                await _maybe_await(page_setup(page))
 
             wait_until = "load" if opts.load_dom else "domcontentloaded"
-            response: Optional[PWResponse] = page.goto(
+            response: Optional[PWResponse] = await page.goto(
                 url, wait_until=wait_until, timeout=opts.timeout
             )
 
             if opts.humanize:
                 vp = page.viewport_size or {"width": 1280, "height": 900}
-                _simulate_human(page, vp)
+                await _simulate_human_async(page, vp)
 
             if network_idle:
-                _wait_networkidle(page, timeout=min(opts.timeout, 15_000))
+                await _wait_networkidle_async(page, timeout=min(opts.timeout, 15_000))
 
             solved = False
-            if solve_cf and _page_has_cf_challenge(page):
-                solved = solve_cloudflare_challenge(
+            if solve_cf and await _page_has_cf_challenge_async(page):
+                solved = await solve_cloudflare_challenge_async(
                     page,
                     timeout_ms=min(opts.timeout, 90_000),
                     log=self._log,
                 )
 
             if wait_selector:
-                page.wait_for_selector(
+                await page.wait_for_selector(
                     wait_selector,
                     state=opts.wait_selector_state,  # type: ignore[arg-type]
                     timeout=opts.timeout,
                 )
 
             if page_action:
-                page_action(page)
+                await _maybe_await(page_action(page))
 
             if wait > 0:
-                page.wait_for_timeout(int(wait))
+                await page.wait_for_timeout(int(wait))
 
-            html = page.content()
-            title = page.title()
+            html = await page.content()
+            title = await page.title()
             final_url = page.url or url
             status = int(response.status) if response is not None else 200
             hdrs: dict[str, str] = {}
@@ -922,11 +803,12 @@ class StealthySession:
 
             if ephemeral:
                 try:
-                    self.set_cookies(ctx.cookies())
+                    cookies = await ctx.cookies()
+                    await self.set_cookies(cookies)
                 except Exception:
                     pass
 
-            still_challenged = _page_has_cf_challenge(page)
+            still_challenged = await _page_has_cf_challenge_async(page)
             elapsed = time.perf_counter() - started
             return DynamicFetchResult(
                 url=final_url,
@@ -962,24 +844,26 @@ class StealthySession:
             raise FetchError(f"StealthyFetcher failed for {url}: {exc}") from exc
         finally:
             try:
-                page.close()
+                await page.close()
             except Exception:
                 pass
             if ephemeral and ctx is not self._context:
                 try:
-                    ctx.close()
+                    await ctx.close()
                 except Exception:
                     pass
             if owns:
-                self.close()
+                await self.close()
 
-    def get_cookies(self) -> list[dict[str, Any]]:
+    async def get_cookies(self) -> list[dict[str, Any]]:
         if self._context is None:
-            return []
+            return list(self._cookie_cache)
         try:
-            return [dict(c) for c in self._context.cookies()]
+            cookies = [dict(c) for c in await self._context.cookies()]
+            self._cookie_cache = cookies
+            return cookies
         except Exception:
-            return []
+            return list(self._cookie_cache)
 
     @property
     def proxy_rotator(self) -> Any:
@@ -988,14 +872,14 @@ class StealthySession:
     def cookies_map(self) -> dict[str, str]:
         from session_store import cookies_to_dict
 
-        return cookies_to_dict(self.get_cookies())
+        return cookies_to_dict(self._cookie_cache)
 
     def cookies_header(self) -> str:
         from session_store import cookies_to_header
 
-        return cookies_to_header(self.get_cookies())
+        return cookies_to_header(self._cookie_cache)
 
-    def set_cookies(self, cookies: CookieInput, url: str = "") -> None:
+    async def set_cookies(self, cookies: CookieInput, url: str = "") -> None:
         if self._context is None:
             self.opts.cookies = cookies
             return
@@ -1003,16 +887,18 @@ class StealthySession:
 
         items = normalize_cookies(cookies, url=url or "https://example.com")
         if items:
-            self._context.add_cookies(items)
+            await self._context.add_cookies(items)
+            self._cookie_cache = [dict(c) for c in items]
 
-    def clear_cookies(self) -> None:
+    async def clear_cookies(self) -> None:
         if self._context is not None:
             try:
-                self._context.clear_cookies()
+                await self._context.clear_cookies()
             except Exception:
                 pass
+        self._cookie_cache = []
 
-    def save(self, path: Optional[Union[str, Path]] = None, **meta: Any) -> Path:
+    async def save(self, path: Optional[Union[str, Path]] = None, **meta: Any) -> Path:
         from session_store import save_session_file
 
         target = Path(path) if path else self._session_file
@@ -1020,17 +906,17 @@ class StealthySession:
             raise ValueError("No path given and no session_file configured")
         return save_session_file(
             target,
-            cookies=self.get_cookies(),
+            cookies=await self.get_cookies(),
             state=self.state,
             meta={
-                "kind": "StealthySession",
+                "kind": "AsyncStealthySession",
                 "engine": self._engine,
                 "browser": self._browser_label,
                 **meta,
             },
         )
 
-    def load(self, path: Optional[Union[str, Path]] = None, *, url: str = "") -> None:
+    async def load(self, path: Optional[Union[str, Path]] = None, *, url: str = "") -> None:
         from session_store import load_session_file
 
         target = Path(path) if path else self._session_file
@@ -1039,39 +925,43 @@ class StealthySession:
         data = load_session_file(target)
         self.state.update(dict(data.get("state") or {}))
         if data.get("cookies"):
-            self.set_cookies(data["cookies"], url=url)
+            await self.set_cookies(data["cookies"], url=url)
 
     def snapshot(self) -> dict[str, Any]:
         return {
-            "cookies": self.get_cookies(),
+            "cookies": list(self._cookie_cache),
             "state": dict(self.state),
-            "kind": "StealthySession",
+            "kind": "AsyncStealthySession",
         }
 
-    def restore(self, snapshot: Mapping[str, Any], *, url: str = "") -> None:
+    async def restore(self, snapshot: Mapping[str, Any], *, url: str = "") -> None:
         if snapshot.get("state"):
             self.state.update(dict(snapshot["state"]))
         if snapshot.get("cookies"):
-            self.set_cookies(snapshot["cookies"], url=url)  # type: ignore[arg-type]
+            await self.set_cookies(snapshot["cookies"], url=url)  # type: ignore[arg-type]
 
 
-class StealthyFetcher:
-    """Advanced stealth browser fetch with fingerprint spoofing + CF bypass.
+class AsyncStealthyFetcher:
+    """Async advanced stealth browser fetch with fingerprint spoofing + CF bypass.
 
     Example::
 
-        from stealthy_fetcher import StealthyFetcher
+        import asyncio
+        from async_stealthy_fetcher import AsyncStealthyFetcher
 
-        r = StealthyFetcher.fetch(
-            "https://protected.example",
-            solve_cloudflare=True,
-            hide_canvas=True,
-            block_webrtc=True,
-            real_chrome=True,
-            headless=True,
-            timeout=60000,
-        )
-        print(r.title, r.extras.get("cloudflare_solved"))
+        async def main():
+            r = await AsyncStealthyFetcher.fetch(
+                "https://protected.example",
+                solve_cloudflare=True,
+                hide_canvas=True,
+                block_webrtc=True,
+                real_chrome=True,
+                headless=True,
+                timeout=60000,
+            )
+            print(r.title, r.extras.get("cloudflare_solved"))
+
+        asyncio.run(main())
     """
 
     _defaults: dict[str, Any] = {
@@ -1096,25 +986,15 @@ class StealthyFetcher:
 
     @classmethod
     def has_patchright(cls) -> bool:
-        return HAS_PATCHRIGHT
+        return HAS_PATCHRIGHT_ASYNC
 
     @classmethod
-    def fetch(cls, url: str, **kwargs: Any) -> DynamicFetchResult:
+    async def fetch(cls, url: str, **kwargs: Any) -> DynamicFetchResult:
         opts = {**cls._defaults, **kwargs}
         log = opts.pop("log", None)
-        with StealthySession(**opts) as session:
+        async with AsyncStealthySession(**opts) as session:
             if log:
                 session.set_logger(log)
-            return session.fetch(url)
+            return await session.fetch(url)
 
     get = fetch
-
-    @classmethod
-    async def async_fetch(cls, url: str, **kwargs: Any) -> DynamicFetchResult:
-        from async_stealthy_fetcher import AsyncStealthyFetcher
-
-        opts = {**cls._defaults, **kwargs}
-        return await AsyncStealthyFetcher.fetch(url, **opts)
-
-    async_get = async_fetch
-
