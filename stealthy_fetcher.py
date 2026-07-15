@@ -450,6 +450,7 @@ class _StealthOptions:
     viewport: Optional[Mapping[str, int]] = None
     user_data_dir: Optional[str] = None
     humanize: bool = True
+    dns_over_https: bool = False
 
 
 class StealthySession:
@@ -505,11 +506,11 @@ class StealthySession:
             viewport=kwargs.pop("viewport", None) or {"width": 1920, "height": 1080},
             user_data_dir=kwargs.pop("user_data_dir", None),
             humanize=humanize,
+            dns_over_https=bool(kwargs.pop("dns_over_https", False)),
         )
         for soft in (
             "selector_config",
             "custom_config",
-            "dns_over_https",
             "simulate_stealth",
         ):
             kwargs.pop(soft, None)
@@ -602,7 +603,10 @@ class StealthySession:
         self._entered = False
 
     def _stealth_args(self) -> list[str]:
+        from doh import apply_chromium_doh
+
         args = list(dict.fromkeys([*BROWSER_ARGS, *STEALTH_LAUNCH_FLAGS]))
+        args = apply_chromium_doh(args, self.opts.dns_over_https)
         # QUIC can look odd behind some proxies; keep optional — do not force disable
         if self.opts.block_webrtc:
             args.extend(

@@ -191,7 +191,21 @@ def _urllib_request(
     timeout: float = DEFAULT_TIMEOUT,
     proxy: Optional[str] = None,
     allow_redirects: bool = True,
+    dns_over_https: bool = False,
 ) -> FetchResponse:
+    from contextlib import nullcontext
+
+    pin_cm: Any = nullcontext()
+    if dns_over_https:
+        try:
+            from doh import pin_url_host, pinned_hostname
+
+            host, ip = pin_url_host(url, timeout=min(5.0, float(timeout)))
+            if host and ip:
+                pin_cm = pinned_hostname(host, ip)
+        except Exception:
+            pin_cm = nullcontext()
+
     req = urllib.request.Request(url, data=data, headers=dict(headers), method=method.upper())
     handlers: list[Any] = []
     if proxy:
@@ -206,23 +220,24 @@ def _urllib_request(
         handlers.append(_NoRedirect())
     opener = urllib.request.build_opener(*handlers) if handlers else urllib.request.build_opener()
     try:
-        with opener.open(req, timeout=timeout) as resp:
-            body = resp.read()
-            hdrs = {k: v for k, v in resp.headers.items()}
-            charset = resp.headers.get_content_charset() or "utf-8"
-            try:
-                text = body.decode(charset, errors="replace")
-            except Exception:
-                text = body.decode("utf-8", errors="replace")
-            return FetchResponse(
-                url=resp.geturl(),
-                status_code=getattr(resp, "status", 200) or 200,
-                headers=hdrs,
-                content=body,
-                text=text,
-                http_version="1.1",
-                ok=True,
-            )
+        with pin_cm:
+            with opener.open(req, timeout=timeout) as resp:
+                body = resp.read()
+                hdrs = {k: v for k, v in resp.headers.items()}
+                charset = resp.headers.get_content_charset() or "utf-8"
+                try:
+                    text = body.decode(charset, errors="replace")
+                except Exception:
+                    text = body.decode("utf-8", errors="replace")
+                return FetchResponse(
+                    url=resp.geturl(),
+                    status_code=getattr(resp, "status", 200) or 200,
+                    headers=hdrs,
+                    content=body,
+                    text=text,
+                    http_version="1.1",
+                    ok=True,
+                )
     except urllib.error.HTTPError as exc:
         body = exc.read() if exc.fp else b""
         try:
@@ -258,6 +273,7 @@ class _FetcherCore:
         verify: bool = True,
         default_headers: bool = True,
         proxy_rotator: Any = None,
+        dns_over_https: bool = False,
     ) -> None:
         self.impersonate = impersonate
         self.stealthy_headers = stealthy_headers
@@ -271,8 +287,18 @@ class _FetcherCore:
         self.verify = verify
         self.default_headers = default_headers
         self.proxy_rotator = proxy_rotator
+        self.dns_over_https = bool(dns_over_https)
         self._session: Any = None
+        self._session_doh = False
         self.last_proxy: Optional[str] = None
+
+    def _make_curl_session(self, *, dns_over_https: bool) -> Any:
+        assert HAS_CURL_CFFI and CurlSession is not None
+        if dns_over_https:
+            from doh import curl_doh_options
+
+            return CurlSession(curl_options=curl_doh_options())
+        return CurlSession()
 
     def attach_session(self, session: Any) -> None:
         self._session = session
@@ -284,6 +310,7 @@ class _FetcherCore:
             except Exception:
                 pass
             self._session = None
+        self._session_doh = False
 
     def request(
         self,
@@ -304,6 +331,7 @@ class _FetcherCore:
         allow_redirects: Optional[bool] = None,
         verify: Optional[bool] = None,
         referer: Optional[str] = None,
+        dns_over_https: Optional[bool] = None,
     ) -> FetchResponse:
         if not url or not str(url).strip():
             raise FetchError("URL is required")
@@ -313,6 +341,7 @@ class _FetcherCore:
         stealth = self.stealthy_headers if stealthy_headers is None else stealthy_headers
         use_http3 = self.http3 if http3 is None else http3
         timeout_val = self.timeout if timeout is None else timeout
+        use_doh = self.dns_over_https if dns_over_https is None else bool(dns_over_https)
 
         from proxy_rotator import (
             is_proxy_error,
@@ -378,6 +407,7 @@ class _FetcherCore:
                         proxies=proxies_val or None,
                         allow_redirects=bool(redirects),
                         verify=bool(verify_val),
+                        dns_over_https=use_doh,
                     )
                 body: Optional[bytes] = None
                 if json_body is not None:
@@ -404,6 +434,7 @@ class _FetcherCore:
                     timeout=float(timeout_val),
                     proxy=proxy_val,
                     allow_redirects=bool(redirects),
+                    dns_over_https=use_doh,
                 )
             except Exception as exc:
                 last_err = exc
@@ -439,6 +470,7 @@ class _FetcherCore:
         proxies: Optional[Mapping[str, str]],
         allow_redirects: bool,
         verify: bool,
+        dns_over_https: bool = False,
     ) -> FetchResponse:
         assert HAS_CURL_CFFI and CurlSession is not None
 
@@ -466,10 +498,11 @@ class _FetcherCore:
         # Drop Nones so curl_cffi does not choke
         kwargs = {k: v for k, v in kwargs.items() if v is not None}
 
+        # Reuse attached session only when its DoH setting matches this request.
         client = self._session
         owns_client = False
-        if client is None:
-            client = CurlSession()
+        if client is None or bool(self._session_doh) != bool(dns_over_https):
+            client = self._make_curl_session(dns_over_https=dns_over_https)
             owns_client = True
         try:
             resp = client.request(method.upper(), url, **kwargs)
@@ -502,6 +535,7 @@ class Fetcher:
         "http3": False,
         "timeout": DEFAULT_TIMEOUT,
         "retries": 2,
+        "dns_over_https": False,
     }
 
     @classmethod
@@ -585,6 +619,7 @@ class FetcherSession:
         session_file: Optional[Union[str, Path]] = None,
         state: Optional[Mapping[str, Any]] = None,
         proxy_rotator: Any = None,
+        dns_over_https: bool = False,
     ) -> None:
         from session_store import load_session_file, normalize_cookies
 
@@ -600,6 +635,7 @@ class FetcherSession:
             follow_redirects=follow_redirects,
             verify=verify,
             proxy_rotator=proxy_rotator,
+            dns_over_https=dns_over_https,
         )
         self._entered = False
         self._cookie_jar = CookieJar()
@@ -618,7 +654,11 @@ class FetcherSession:
         if self._entered:
             raise RuntimeError("FetcherSession already entered")
         if HAS_CURL_CFFI and CurlSession is not None:
-            self._core.attach_session(CurlSession())
+            session = self._core._make_curl_session(
+                dns_over_https=self._core.dns_over_https
+            )
+            self._core.attach_session(session)
+            self._core._session_doh = self._core.dns_over_https
         self._entered = True
         if self._seed_cookies:
             self.set_cookies(self._seed_cookies)
@@ -810,11 +850,14 @@ def fetch_bytes(
     impersonate: ImpersonateType = DEFAULT_IMPERSONATE,
     http3: bool = False,
     referer: Optional[str] = None,
+    dns_over_https: Optional[bool] = None,
 ) -> tuple[bytes, str, int]:
     """Convenience helper for binary downloads (videos / images).
 
     Returns ``(content, content_type, status_code)``.
     """
+    from doh import resolve_dns_over_https
+
     resp = Fetcher.get(
         url,
         headers=headers,
@@ -824,6 +867,7 @@ def fetch_bytes(
         http3=http3,
         stealthy_headers=True,
         referer=referer,
+        dns_over_https=resolve_dns_over_https(dns_over_https),
     )
     content_type = ""
     for key, value in resp.headers.items():

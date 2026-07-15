@@ -88,6 +88,7 @@ class _SessionOptions:
     additional_args: Optional[Mapping[str, Any]] = None
     simulate_stealth: bool = True
     viewport: Optional[Mapping[str, int]] = None
+    dns_over_https: bool = False
 
 
 def _as_bool_chrome(kwargs: dict[str, Any]) -> bool:
@@ -205,10 +206,10 @@ class DynamicSession:
             additional_args=kwargs.pop("additional_args", None),
             simulate_stealth=bool(kwargs.pop("simulate_stealth", True)),
             viewport=kwargs.pop("viewport", None),
+            dns_over_https=bool(kwargs.pop("dns_over_https", False)),
         )
         kwargs.pop("selector_config", None)
         kwargs.pop("custom_config", None)
-        kwargs.pop("dns_over_https", None)
         if kwargs:
             extra = dict(self.opts.additional_args or {})
             extra.update(kwargs)
@@ -289,7 +290,9 @@ class DynamicSession:
             browser = pw.chromium.connect_over_cdp(opts.cdp_url)
             return browser, "cdp"
 
-        args = list(BROWSER_ARGS)
+        from doh import apply_chromium_doh
+
+        args = apply_chromium_doh(list(BROWSER_ARGS), opts.dns_over_https)
         if opts.extra_flags:
             args.extend(str(f) for f in opts.extra_flags)
 

@@ -4,7 +4,7 @@
 
 **语言 / Language：** [English](README.md) | **简体中文**
 
-![Python](https://img.shields.io/badge/python-3.10%2B-blue) ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey) ![Version](https://img.shields.io/badge/version-1.3.0-blue) ![License](https://img.shields.io/badge/license-MIT-green)
+![Python](https://img.shields.io/badge/python-3.10%2B-blue) ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey) ![Version](https://img.shields.io/badge/version-1.3.0-blue) ![License](https://img.shields.io/badge/license-BSD--3--Clause-green)
 
 ---
 
@@ -28,6 +28,7 @@
 | **第三层 — 隐秘** | `stealthy_fetcher.py` | Patchright/Playwright + 指纹伪装 + Cloudflare 挑战流程 |
 | **Session** | `sessions.py` | `FetcherSession` / `DynamicSession` / `StealthySession` — Cookie + 状态 |
 | **代理** | `proxy_rotator.py` | 轮询 / 随机 / 自定义轮换；支持单次请求覆盖 |
+| **DNS** | `doh.py` | 可选 Cloudflare DNS-over-HTTPS（配合代理防 DNS 泄漏） |
 | **屏蔽** | `request_blocking.py` | `blocked_domains` + `block_ads`（约 3500 个追踪域名） |
 
 ---
@@ -68,6 +69,7 @@
 - 模拟人类操作；挑战页等待；多策略重试
 - UI / `SCRAPER_PROXY` / `HTTP_PROXY` 代理；失效环境代理自动跳过
 - 全 Session **ProxyRotator**；浏览器 Fetcher **域名/广告屏蔽**
+- **DNS-over-HTTPS** — 可选 Cloudflare DoH（`dns_over_https=True` / `SCRAPER_DOH=1`），防止使用代理时 DNS 泄漏
 - 端口占用时自动换到 8001+
 
 ---
@@ -86,6 +88,7 @@ spaider_crawler/
 ├── session_store.py       # Cookie / 状态 JSON 工具
 ├── sessions.py            # Session 统一导出
 ├── proxy_rotator.py       # 代理轮换策略
+├── doh.py                 # Cloudflare DNS-over-HTTPS
 ├── request_blocking.py    # 域名 + 广告请求屏蔽
 ├── ad_domains.py          # 内置追踪域名列表加载
 ├── image_utils.py         # 图片 URL 清理 / 垃圾过滤
@@ -229,6 +232,7 @@ r = DynamicFetcher.fetch(
     wait_selector="main",
     block_ads=True,
     blocked_domains={"metrics.vendor.com"},
+    dns_over_https=True,  # Cloudflare DoH，配合代理防 DNS 泄漏
 )
 
 with DynamicSession(real_chrome=True, session_file=".sessions/web.json") as s:
@@ -247,6 +251,7 @@ r = StealthyFetcher.fetch(
     hide_canvas=True,
     block_webrtc=True,
     block_ads=True,
+    dns_over_https=True,
     real_chrome=True,
     timeout=60000,
 )
@@ -277,9 +282,15 @@ with FetcherSession(proxy_rotator=rotator) as s:
 
 # 也支持随机 / 自定义：
 # ProxyRotator(proxies, strategy=random_rotation)
+
+# HTTP 层 DoH（curl_cffi / libcurl CURLOPT_DOH_URL）：
+from fetcher import Fetcher
+Fetcher.get("https://example.com", proxy="http://127.0.0.1:7890", dns_over_https=True)
 ```
 
 同一 Session 不要同时设静态 `proxy=` 与 `proxy_rotator=`。单次请求的 `proxy=` 优先级最高。
+
+Web UI 管道可设 `SCRAPER_DOH=1`（或 `DNS_OVER_HTTPS=true`）默认开启 DoH。
 
 ---
 
@@ -294,7 +305,7 @@ with FetcherSession(proxy_rotator=rotator) as s:
   "features": [
     "video_platforms", "wbi_comments", "download_media", "saved_profile",
     "stealth_fetcher", "dynamic_fetcher", "stealthy_fetcher",
-    "session_manager", "proxy_rotator", "request_blocking"
+    "session_manager", "proxy_rotator", "request_blocking", "dns_over_https"
   ]
 }
 ```
@@ -320,6 +331,7 @@ SSE 流。请求体字段：
 | `max_retries` | `2` | 0–4 |
 | `simulate_human` | `true` | 鼠标/滚动 |
 | `block_resources` | `false` | 跳过图片/字体 |
+| `dns_over_https` | `false` | Cloudflare DoH（亦可设环境变量 `SCRAPER_DOH`） |
 | `auto_selector` / `auto_selector_ai` | `true` | 智能选择器 |
 | `ai_api_key` / `ai_base_url` / `ai_model` | `""` | LLM 覆盖 |
 | `download_media` | `true` | 保存到 `downloads/` |
@@ -407,4 +419,4 @@ with urllib.request.urlopen(req, timeout=300) as resp:
 
 ## 许可证
 
-MIT License — 见 [LICENSE](LICENSE)。
+[BSD 3-Clause](LICENSE) © 2026 Nameless

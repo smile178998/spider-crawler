@@ -66,6 +66,7 @@ class ScrapeRequest(BaseModel):
     ai_model: str = ""
     download_media: bool = True
     use_saved_profile: bool = True
+    dns_over_https: bool = False
 
     @field_validator("url")
     @classmethod
@@ -116,6 +117,7 @@ async def health():
             "session_manager",
             "proxy_rotator",
             "request_blocking",
+            "dns_over_https",
         ],
     }
 
@@ -155,6 +157,7 @@ async def scrape(req: ScrapeRequest):
             ai_model=req.ai_model.strip(),
             download_media=req.download_media,
             use_saved_profile=req.use_saved_profile,
+            dns_over_https=req.dns_over_https,
         )
 
     thread = threading.Thread(target=worker, daemon=True)

@@ -102,6 +102,7 @@ function buildRequestBody() {
     max_retries: clamp(fieldValue("max-retries", "2"), 0, 4, 2),
     simulate_human: fieldChecked("simulate-human", true),
     block_resources: fieldChecked("block-resources", false),
+    dns_over_https: fieldChecked("dns-over-https", false),
     auto_selector: fieldChecked("auto-selector", true),
     auto_selector_ai: fieldChecked("auto-selector-ai", true),
     download_media: fieldChecked("download-media", true),

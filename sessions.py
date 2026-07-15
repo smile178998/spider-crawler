@@ -47,6 +47,14 @@ from request_blocking import (
     merge_blocked_domains,
 )
 from ad_domains import ad_domain_count, load_ad_domains
+from doh import (
+    CLOUDFLARE_DOH_URL,
+    apply_chromium_doh,
+    chromium_doh_args,
+    env_dns_over_https_enabled,
+    resolve_dns_over_https,
+    resolve_host,
+)
 
 __all__ = [
     "FetcherSession",
@@ -72,4 +80,10 @@ __all__ = [
     "merge_blocked_domains",
     "ad_domain_count",
     "load_ad_domains",
+    "CLOUDFLARE_DOH_URL",
+    "apply_chromium_doh",
+    "chromium_doh_args",
+    "env_dns_over_https_enabled",
+    "resolve_dns_over_https",
+    "resolve_host",
 ]

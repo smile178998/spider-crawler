@@ -28,6 +28,7 @@ A Playwright-powered web scraper with a FastAPI UI, plus a three-tier programmat
 | **Tier 3 — Stealth** | `stealthy_fetcher.py` | Patchright/Playwright + fingerprint spoofing + Cloudflare UI flow |
 | **Sessions** | `sessions.py` | `FetcherSession` / `DynamicSession` / `StealthySession` — cookies + state |
 | **Proxy** | `proxy_rotator.py` | Round-robin / random / custom rotation; per-request override |
+| **DNS** | `doh.py` | Optional Cloudflare DNS-over-HTTPS (leak protection with proxies) |
 | **Blocking** | `request_blocking.py` | `blocked_domains` + `block_ads` (~3,500 trackers) |
 
 ---
@@ -68,6 +69,7 @@ A Playwright-powered web scraper with a FastAPI UI, plus a three-tier programmat
 - Human-like mouse/scroll; challenge-page wait; multi-strategy retry
 - Proxy via UI / `SCRAPER_PROXY` / `HTTP_PROXY`; dead env proxies skipped
 - **ProxyRotator** for all Sessions; **domain/ad blocking** on browser fetchers
+- **DNS-over-HTTPS** — optional Cloudflare DoH (`dns_over_https=True` / `SCRAPER_DOH=1`) to prevent DNS leaks when using proxies
 - Port auto-select if 8000 is busy (8001+)
 
 ---
@@ -86,6 +88,7 @@ spaider_crawler/
 ├── session_store.py       # Cookie / state JSON helpers
 ├── sessions.py            # Unified session exports
 ├── proxy_rotator.py       # Proxy rotation strategies
+├── doh.py                 # Cloudflare DNS-over-HTTPS helpers
 ├── request_blocking.py    # Domain + ad request blocking
 ├── ad_domains.py          # Loads bundled tracker list
 ├── image_utils.py         # Image URL cleanup / junk filter
@@ -229,6 +232,7 @@ r = DynamicFetcher.fetch(
     wait_selector="main",
     block_ads=True,
     blocked_domains={"metrics.vendor.com"},
+    dns_over_https=True,  # Cloudflare DoH — avoid DNS leaks with proxies
 )
 
 with DynamicSession(real_chrome=True, session_file=".sessions/web.json") as s:
@@ -247,6 +251,7 @@ r = StealthyFetcher.fetch(
     hide_canvas=True,
     block_webrtc=True,
     block_ads=True,
+    dns_over_https=True,
     real_chrome=True,
     timeout=60000,
 )
@@ -277,9 +282,15 @@ with FetcherSession(proxy_rotator=rotator) as s:
 
 # Random / custom strategies also supported:
 # ProxyRotator(proxies, strategy=random_rotation)
+
+# HTTP layer DoH (libcurl CURLOPT_DOH_URL via curl_cffi):
+from fetcher import Fetcher
+Fetcher.get("https://example.com", proxy="http://127.0.0.1:7890", dns_over_https=True)
 ```
 
 Do not pass both static `proxy=` and `proxy_rotator=` on the same session. Per-request `proxy=` always wins.
+
+Set `SCRAPER_DOH=1` (or `DNS_OVER_HTTPS=true`) to enable DoH by default for the Web UI pipeline.
 
 ---
 
@@ -294,7 +305,7 @@ Do not pass both static `proxy=` and `proxy_rotator=` on the same session. Per-r
   "features": [
     "video_platforms", "wbi_comments", "download_media", "saved_profile",
     "stealth_fetcher", "dynamic_fetcher", "stealthy_fetcher",
-    "session_manager", "proxy_rotator", "request_blocking"
+    "session_manager", "proxy_rotator", "request_blocking", "dns_over_https"
   ]
 }
 ```
@@ -320,6 +331,7 @@ SSE stream. Body fields:
 | `max_retries` | `2` | 0–4 |
 | `simulate_human` | `true` | Mouse/scroll |
 | `block_resources` | `false` | Skip images/fonts |
+| `dns_over_https` | `false` | Cloudflare DoH (also env `SCRAPER_DOH`) |
 | `auto_selector` / `auto_selector_ai` | `true` | Smart selectors |
 | `ai_api_key` / `ai_base_url` / `ai_model` | `""` | LLM overrides |
 | `download_media` | `true` | Save to `downloads/` |

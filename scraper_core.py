@@ -168,6 +168,7 @@ class FetchConfig:
     simulate_human: bool = True
     block_resources: bool = False
     use_saved_profile: bool = True
+    dns_over_https: bool = False
 
 
 def _stealth_init_script(languages: list[str], navigator_platform: str) -> str:
@@ -532,16 +533,24 @@ def _setup_resource_blocking(page: Page) -> None:
     page.route("**/*", handler)
 
 
+def _browser_args(cfg: FetchConfig) -> list[str]:
+    from doh import apply_chromium_doh
+
+    return apply_chromium_doh(list(BROWSER_ARGS), cfg.dns_over_https)
+
+
 def _launch_browser(pw: Playwright, cfg: FetchConfig, headless: bool, log: LogFn) -> Browser:
     launch_kwargs: dict = {
         "headless": headless,
-        "args": BROWSER_ARGS,
+        "args": _browser_args(cfg),
     }
 
     proxy = _parse_proxy(cfg.proxy)
     if proxy:
         launch_kwargs["proxy"] = proxy
         log(f"[Browser] Using proxy: {proxy['server']}")
+    if cfg.dns_over_https:
+        log("[Browser] DNS-over-HTTPS enabled (Cloudflare DoH).")
 
     if cfg.use_chrome:
         try:
@@ -706,13 +715,15 @@ def _attempt_fetch(
                 "viewport": viewport,
                 "locale": profile["locale"],
                 "timezone_id": profile["timezone"],
-                "args": BROWSER_ARGS,
+                "args": _browser_args(cfg),
                 "ignore_https_errors": True,
             }
             proxy = _parse_proxy(cfg.proxy)
             if proxy:
                 launch_kwargs["proxy"] = proxy
                 log(f"[Browser] Using proxy: {proxy['server']}")
+            if cfg.dns_over_https:
+                log("[Browser] DNS-over-HTTPS enabled (Cloudflare DoH).")
             if cfg.use_chrome:
                 launch_kwargs["channel"] = "chrome"
             log("[Browser] Using saved login profile — sessions persist for all sites.")
@@ -743,6 +754,7 @@ def _attempt_fetch(
                     simulate_human=cfg.simulate_human,
                     block_resources=cfg.block_resources,
                     use_saved_profile=False,
+                    dns_over_https=cfg.dns_over_https,
                 )
                 return _attempt_fetch(pw, fallback, profile, headless, wait_ms, log)
 
@@ -791,6 +803,8 @@ def browser_fetch(
         if parsed:
             log(f"[Browser] Using proxy from {source}: {parsed['server']}")
 
+    from doh import resolve_dns_over_https
+
     cfg = FetchConfig(
         url=url,
         wait_ms=wait_ms,
@@ -803,6 +817,7 @@ def browser_fetch(
         simulate_human=bool(kwargs.get("simulate_human", True)),
         block_resources=bool(kwargs.get("block_resources", False)),
         use_saved_profile=bool(kwargs.get("use_saved_profile", True)),
+        dns_over_https=resolve_dns_over_https(kwargs.get("dns_over_https")),
     )
 
     if HAS_STEALTH:
@@ -862,6 +877,7 @@ def browser_fetch(
             simulate_human=cfg.simulate_human,
             block_resources=cfg.block_resources,
             use_saved_profile=cfg.use_saved_profile,
+            dns_over_https=cfg.dns_over_https,
         )
         with sync_playwright() as pw:
             profile = random.choice(BROWSER_PROFILES)
