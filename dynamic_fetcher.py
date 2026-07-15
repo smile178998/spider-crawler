@@ -180,6 +180,7 @@ class DynamicSession:
     def __init__(self, **kwargs: Any) -> None:
         session_file = kwargs.pop("session_file", None)
         state = kwargs.pop("state", None)
+        proxy_rotator = kwargs.pop("proxy_rotator", None)
         real_chrome = _as_bool_chrome(kwargs)
         self.opts = _SessionOptions(
             headless=bool(kwargs.pop("headless", True)),
@@ -225,6 +226,14 @@ class DynamicSession:
         self._cookies_seeded = False
         self.state: dict[str, Any] = dict(state or {})
         self._session_file = Path(session_file) if session_file else None
+        self._proxy_rotator = proxy_rotator
+        self.last_proxy: Optional[str] = None
+
+        if self._proxy_rotator is not None and self.opts.proxy:
+            raise ValueError(
+                "Cannot use proxy_rotator together with a static proxy. "
+                "Pass one or the other (per-request proxy= still overrides)."
+            )
 
         if self._session_file and self._session_file.is_file():
             from session_store import load_session_file
@@ -291,9 +300,11 @@ class DynamicSession:
             "headless": opts.headless,
             "args": args,
         }
-        proxy = _normalize_proxy(opts.proxy)
-        if proxy:
-            launch_kwargs["proxy"] = proxy
+        # Static session proxy only — rotator / per-request handled at context level.
+        if self._proxy_rotator is None:
+            proxy = _normalize_proxy(opts.proxy)
+            if proxy:
+                launch_kwargs["proxy"] = proxy
 
         errors: list[str] = []
 
@@ -322,7 +333,6 @@ class DynamicSession:
             browser = try_chromium()
             if browser is not None:
                 return browser, "chromium"
-            # Dev machines often have Chrome but no Playwright Chromium bundle.
             browser = try_chrome()
             if browser is not None:
                 return browser, "chrome"
@@ -332,6 +342,76 @@ class DynamicSession:
         )
         detail = " | ".join(errors) if errors else "unknown launch error"
         raise FetchError(f"Unable to launch browser ({detail}). {hint}")
+
+    def _pick_fetch_proxy(self, overrides: dict[str, Any]) -> Optional[dict]:
+        from proxy_rotator import normalize_proxy, proxy_to_url, resolve_request_proxy
+
+        if "proxy" in overrides:
+            chosen = overrides.pop("proxy")
+        else:
+            chosen = resolve_request_proxy(
+                request_proxy=None,
+                proxy_rotator=self._proxy_rotator,
+                session_proxy=self.opts.proxy if self._proxy_rotator is None else None,
+            )
+        parsed = normalize_proxy(chosen) if chosen not in (None, "") else None
+        self.last_proxy = proxy_to_url(parsed) if parsed else None
+        return parsed
+
+    def _context_for_proxy(
+        self, proxy: Optional[dict], url: str
+    ) -> tuple[BrowserContext, bool]:
+        """Return ``(context, ephemeral)``. Ephemeral = per-request proxied context."""
+        assert self._browser is not None
+        assert self._context is not None
+        # Use shared context when no per-request proxy from rotator/override
+        if proxy is None or self._proxy_rotator is None and "proxy" not in getattr(
+            self, "_pending_proxy_override", {}
+        ):
+            if proxy is None:
+                return self._context, False
+            # Static proxy was already applied at browser launch
+            if self._proxy_rotator is None and self.opts.proxy:
+                return self._context, False
+
+        if proxy is None:
+            return self._context, False
+
+        profile = _pick_profile(
+            self.opts.useragent, self.opts.locale, self.opts.viewport
+        )
+        viewport = profile["viewport"]
+        headers = _build_headers(
+            profile["ua"], url, profile["languages"], profile["platform"]
+        )
+        if self.opts.google_search:
+            headers["Referer"] = "https://www.google.com/"
+        if self.opts.extra_headers:
+            headers.update({str(k): str(v) for k, v in self.opts.extra_headers.items()})
+
+        ctx_kwargs: dict[str, Any] = {
+            "user_agent": profile["ua"],
+            "viewport": {"width": viewport["width"], "height": viewport["height"]},
+            "locale": profile["locale"],
+            "timezone_id": profile["timezone"],
+            "ignore_https_errors": True,
+            "extra_http_headers": headers,
+            "proxy": proxy,
+        }
+        if self.opts.additional_args:
+            ctx_kwargs.update(dict(self.opts.additional_args))
+        ctx = self._browser.new_context(**ctx_kwargs)
+        if self.opts.simulate_stealth:
+            ctx.add_init_script(
+                _stealth_init_script(profile["languages"], profile["navigator_platform"])
+            )
+        existing = self.get_cookies()
+        if existing:
+            try:
+                ctx.add_cookies(existing)
+            except Exception:
+                pass
+        return ctx, True
 
     def _new_context(self, browser: Browser, url: str) -> BrowserContext:
         opts = self.opts
@@ -370,7 +450,6 @@ class DynamicSession:
                 ctx.add_init_script(path=str(path))
             else:
                 ctx.add_init_script(opts.init_script)
-        # Cookies injected once via set_cookies() on session enter
         return ctx
 
     def fetch(self, url: str, **overrides: Any) -> DynamicFetchResult:
@@ -379,6 +458,9 @@ class DynamicSession:
             raise FetchError("URL is required")
         url = str(url).strip()
 
+        # Extract per-request proxy before option merge (not a SessionOptions field)
+        fetch_proxy = self._pick_fetch_proxy(overrides)
+
         saved = self.opts
         if overrides:
             merged = field_replace(saved, **_overrides_to_opts(overrides))
@@ -386,6 +468,8 @@ class DynamicSession:
 
         started = time.perf_counter()
         owns_runtime = False
+        ephemeral = False
+        ctx: Optional[BrowserContext] = None
         try:
             if not self._entered:
                 self.__enter__()
@@ -394,7 +478,18 @@ class DynamicSession:
             assert self._browser is not None
             assert self._context is not None
             engine = self._browser_engine or "chromium"
-            ctx = self._context
+
+            # Rotator or explicit per-request proxy → ephemeral context; else shared
+            if fetch_proxy is not None and (
+                self._proxy_rotator is not None or self.opts.proxy is None
+            ):
+                ctx, ephemeral = self._context_for_proxy(fetch_proxy, url)
+            elif fetch_proxy is not None:
+                # Override static session proxy for this request only
+                ctx, ephemeral = self._context_for_proxy(fetch_proxy, url)
+            else:
+                ctx, ephemeral = self._context, False
+
             page = ctx.new_page()
             page.set_default_timeout(self.opts.timeout)
 
@@ -445,6 +540,13 @@ class DynamicSession:
                     except Exception:
                         hdrs = {}
 
+                # Merge cookies from ephemeral proxied context back into session store
+                if ephemeral:
+                    try:
+                        self.set_cookies(ctx.cookies())
+                    except Exception:
+                        pass
+
                 elapsed = time.perf_counter() - started
                 return DynamicFetchResult(
                     url=final_url,
@@ -464,6 +566,7 @@ class DynamicSession:
                         "engine": "playwright",
                         "headless": self.opts.headless,
                         "cookies": len(self.get_cookies()),
+                        "proxy": self.last_proxy,
                     },
                 )
             finally:
@@ -471,12 +574,28 @@ class DynamicSession:
                     page.close()
                 except Exception:
                     pass
+                if ephemeral and ctx is not None and ctx is not self._context:
+                    try:
+                        ctx.close()
+                    except Exception:
+                        pass
         except Exception as exc:
+            from proxy_rotator import is_proxy_error
+
+            if self._proxy_rotator is not None and fetch_proxy and is_proxy_error(exc):
+                try:
+                    self._proxy_rotator.mark_failed(fetch_proxy)
+                except Exception:
+                    pass
             raise FetchError(f"DynamicFetcher failed for {url}: {exc}") from exc
         finally:
             self.opts = saved
             if owns_runtime:
                 self.close()
+
+    @property
+    def proxy_rotator(self) -> Any:
+        return self._proxy_rotator
 
     def get_cookies(self) -> list[dict[str, Any]]:
         if self._context is None:

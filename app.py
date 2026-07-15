@@ -114,6 +114,7 @@ async def health():
             "dynamic_fetcher",
             "stealthy_fetcher",
             "session_manager",
+            "proxy_rotator",
         ],
     }
 

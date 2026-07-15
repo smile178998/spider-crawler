@@ -31,6 +31,16 @@ from session_store import (
     parse_cookie_header,
     save_session_file,
 )
+from proxy_rotator import (
+    ProxyRotator,
+    ProxyType,
+    cyclic_rotation,
+    random_rotation,
+    resolve_request_proxy,
+    normalize_proxy,
+    proxy_to_url,
+    is_proxy_error,
+)
 
 __all__ = [
     "FetcherSession",
@@ -43,4 +53,12 @@ __all__ = [
     "normalize_cookies",
     "parse_cookie_header",
     "save_session_file",
+    "ProxyRotator",
+    "ProxyType",
+    "cyclic_rotation",
+    "random_rotation",
+    "resolve_request_proxy",
+    "normalize_proxy",
+    "proxy_to_url",
+    "is_proxy_error",
 ]
