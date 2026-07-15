@@ -162,9 +162,24 @@ def _block_heavy_resources(page: Page) -> None:
 
 
 class DynamicSession:
-    """Reusable Playwright session (Chromium or system Chrome)."""
+    """Reusable Playwright session with persistent cookies / storage across fetches.
+
+    One browser context is shared for the lifetime of the session, so login
+    cookies, ``localStorage`` (same origin), and custom ``state`` survive
+    multiple ``fetch()`` calls.
+
+    Example::
+
+        with DynamicSession(real_chrome=True, session_file=".sessions/dyn.json") as s:
+            s.fetch("https://example.com/login")
+            s.state["step"] = "logged_in"
+            s.fetch("https://example.com/dashboard")
+            s.save()
+    """
 
     def __init__(self, **kwargs: Any) -> None:
+        session_file = kwargs.pop("session_file", None)
+        state = kwargs.pop("state", None)
         real_chrome = _as_bool_chrome(kwargs)
         self.opts = _SessionOptions(
             headless=bool(kwargs.pop("headless", True)),
@@ -191,37 +206,62 @@ class DynamicSession:
             simulate_stealth=bool(kwargs.pop("simulate_stealth", True)),
             viewport=kwargs.pop("viewport", None),
         )
-        # Ignore Scrapling-only knobs so callers can pass them safely.
         kwargs.pop("selector_config", None)
         kwargs.pop("custom_config", None)
         kwargs.pop("block_ads", None)
         kwargs.pop("blocked_domains", None)
         kwargs.pop("dns_over_https", None)
         if kwargs:
-            # Keep forward-compatible: stash unknown keys into additional_args
             extra = dict(self.opts.additional_args or {})
             extra.update(kwargs)
             self.opts.additional_args = extra
 
         self._pw: Optional[Playwright] = None
         self._browser: Optional[Browser] = None
+        self._context: Optional[BrowserContext] = None
         self._owns_browser = False
         self._browser_engine = ""
         self._entered = False
+        self._cookies_seeded = False
+        self.state: dict[str, Any] = dict(state or {})
+        self._session_file = Path(session_file) if session_file else None
+
+        if self._session_file and self._session_file.is_file():
+            from session_store import load_session_file
+
+            data = load_session_file(self._session_file)
+            self.state.update(dict(data.get("state") or {}))
+            if data.get("cookies") and not self.opts.cookies:
+                self.opts.cookies = data["cookies"]
 
     def __enter__(self) -> "DynamicSession":
         if self._entered:
             raise RuntimeError("DynamicSession already entered")
         self._pw = sync_playwright().start()
         self._browser, self._browser_engine = self._launch(self._pw)
+        self._context = self._new_context(self._browser, "https://example.com")
         self._owns_browser = True
         self._entered = True
+        if self.opts.cookies:
+            self.set_cookies(self.opts.cookies)
+            self._cookies_seeded = True
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
+        if self._session_file:
+            try:
+                self.save()
+            except Exception:
+                pass
         self.close()
 
     def close(self) -> None:
+        if self._context is not None:
+            try:
+                self._context.close()
+            except Exception:
+                pass
+        self._context = None
         if self._browser is not None and self._owns_browser:
             try:
                 self._browser.close()
@@ -235,6 +275,7 @@ class DynamicSession:
                 pass
         self._pw = None
         self._entered = False
+
 
     def _launch(self, pw: Playwright) -> tuple[Browser, str]:
         opts = self.opts
@@ -329,16 +370,15 @@ class DynamicSession:
                 ctx.add_init_script(path=str(path))
             else:
                 ctx.add_init_script(opts.init_script)
-        _inject_cookies(ctx, opts.cookies, url)
+        # Cookies injected once via set_cookies() on session enter
         return ctx
 
     def fetch(self, url: str, **overrides: Any) -> DynamicFetchResult:
-        """Navigate and return the rendered page as a ``DynamicFetchResult``."""
+        """Navigate and return the rendered page; reuses one BrowserContext."""
         if not url or not str(url).strip():
             raise FetchError("URL is required")
         url = str(url).strip()
 
-        # Per-call overrides (shallow) without mutating session defaults permanently
         saved = self.opts
         if overrides:
             merged = field_replace(saved, **_overrides_to_opts(overrides))
@@ -352,9 +392,9 @@ class DynamicSession:
                 owns_runtime = True
 
             assert self._browser is not None
-            browser = self._browser
+            assert self._context is not None
             engine = self._browser_engine or "chromium"
-            ctx = self._new_context(browser, url)
+            ctx = self._context
             page = ctx.new_page()
             page.set_default_timeout(self.opts.timeout)
 
@@ -423,11 +463,12 @@ class DynamicSession:
                         "browser": engine,
                         "engine": "playwright",
                         "headless": self.opts.headless,
+                        "cookies": len(self.get_cookies()),
                     },
                 )
             finally:
                 try:
-                    ctx.close()
+                    page.close()
                 except Exception:
                     pass
         except Exception as exc:
@@ -436,6 +477,78 @@ class DynamicSession:
             self.opts = saved
             if owns_runtime:
                 self.close()
+
+    def get_cookies(self) -> list[dict[str, Any]]:
+        if self._context is None:
+            return []
+        try:
+            return [dict(c) for c in self._context.cookies()]
+        except Exception:
+            return []
+
+    def cookies_map(self) -> dict[str, str]:
+        from session_store import cookies_to_dict
+
+        return cookies_to_dict(self.get_cookies())
+
+    def cookies_header(self) -> str:
+        from session_store import cookies_to_header
+
+        return cookies_to_header(self.get_cookies())
+
+    def set_cookies(self, cookies: CookieInput, url: str = "") -> None:
+        if self._context is None:
+            self.opts.cookies = cookies
+            return
+        from session_store import normalize_cookies
+
+        items = normalize_cookies(cookies, url=url or "https://example.com")
+        if items:
+            self._context.add_cookies(items)
+
+    def clear_cookies(self) -> None:
+        if self._context is not None:
+            try:
+                self._context.clear_cookies()
+            except Exception:
+                pass
+
+    def save(self, path: Optional[Union[str, Path]] = None, **meta: Any) -> Path:
+        from session_store import save_session_file
+
+        target = Path(path) if path else self._session_file
+        if target is None:
+            raise ValueError("No path given and no session_file configured")
+        return save_session_file(
+            target,
+            cookies=self.get_cookies(),
+            state=self.state,
+            meta={"kind": "DynamicSession", "browser": self._browser_engine, **meta},
+        )
+
+    def load(self, path: Optional[Union[str, Path]] = None, *, url: str = "") -> None:
+        from session_store import load_session_file
+
+        target = Path(path) if path else self._session_file
+        if target is None or not Path(target).is_file():
+            raise FileNotFoundError(f"Session file not found: {target}")
+        data = load_session_file(target)
+        self.state.update(dict(data.get("state") or {}))
+        if data.get("cookies"):
+            self.set_cookies(data["cookies"], url=url)
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "cookies": self.get_cookies(),
+            "state": dict(self.state),
+            "kind": "DynamicSession",
+        }
+
+    def restore(self, snapshot: Mapping[str, Any], *, url: str = "") -> None:
+        if snapshot.get("state"):
+            self.state.update(dict(snapshot["state"]))
+        if snapshot.get("cookies"):
+            self.set_cookies(snapshot["cookies"], url=url)  # type: ignore[arg-type]
 
 
 def _overrides_to_opts(overrides: dict[str, Any]) -> dict[str, Any]:
